@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#05010f" />
+    <meta
+      name="description"
+      content="Aurora Protocol — a fast-paced neon-synthwave run & gun platformer. Mänsklighetens minne får inte dö."
+    />
+    <title>Aurora Protocol</title>
+  </head>
+  <body>
+    <!-- WebGPU drawing surface; sized to the full window by src/style.css -->
+    <canvas id="game" aria-label="Aurora Protocol game canvas"></canvas>
+
+    <!-- Filled in by WebGPURenderer.showFallbackMessage() when WebGPU is missing -->
+    <div id="fallback"></div>
+
+    <!-- HUD / overlay text root (populated by ui/Hud.ts) -->
+    <div id="hud-root"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
