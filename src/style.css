@@ -1,0 +1,100 @@
+/* Aurora Protocol — global chrome for the Fas 0 demo. */
+
+:root {
+  --neon-pink: #ff2fd6;
+  --neon-cyan: #41f6ff;
+  --bg-deep: #05010f;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-deep);
+}
+
+#game {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  touch-action: none; /* we handle multi-touch input ourselves */
+}
+
+#game.hidden {
+  display: none;
+}
+
+/* ---- HUD ------------------------------------------------------------- */
+
+#hud-root {
+  pointer-events: none;
+}
+
+.hud {
+  position: fixed;
+  top: 12px;
+  left: 16px;
+  right: 16px;
+  display: flex;
+  gap: 18px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-family: 'Courier New', ui-monospace, monospace;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: rgba(191, 239, 255, 0.85);
+  text-shadow:
+    0 0 6px rgba(65, 246, 255, 0.6),
+    0 0 14px rgba(255, 47, 214, 0.35);
+}
+
+.hud-title {
+  font-weight: bold;
+  color: var(--neon-pink);
+}
+
+.hud-message {
+  color: var(--neon-cyan);
+}
+
+/* ---- WebGPU fallback page -------------------------------------------- */
+
+#fallback {
+  position: fixed;
+  inset: 0;
+  display: none;
+  place-items: center;
+  background:
+    radial-gradient(1200px 500px at 50% 120%, rgba(255, 47, 214, 0.25), transparent),
+    var(--bg-deep);
+  z-index: 10;
+}
+
+#fallback.visible {
+  display: grid;
+}
+
+.fallback-box {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 40px;
+  text-align: center;
+  font-family: 'Courier New', ui-monospace, monospace;
+  color: #cfe8ff;
+}
+
+.fallback-box h1 {
+  font-size: 28px;
+  letter-spacing: 0.2em;
+  color: var(--neon-pink);
+  text-shadow: 0 0 18px rgba(255, 47, 214, 0.7);
+}
+
+.fallback-box a {
+  color: var(--neon-cyan);
+}
