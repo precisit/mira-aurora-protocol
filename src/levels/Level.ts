@@ -1,11 +1,12 @@
 import type { Vec2 } from '../game/entities';
+import type { FragmentTypeName } from '../game/entities';
 import {
-  ASCII_MARKERS,
   ASCII_TILES,
+  SPAWN_CHARS,
   TILE_SIZE,
   TileType,
   type LevelData,
-  type LevelMarker,
+  type LevelSpawn,
 } from './LevelData';
 
 /**
@@ -86,42 +87,68 @@ export class Level {
     return this.isSolidAtTile(Level.worldToTileX(worldX), Level.worldToTileY(worldY));
   }
 
-  // -------------------------------------------------------------- markers --
+  // -------------------------------------------------------------- spawns --
 
-  /** First marker of `kind` converted to world px, or undefined. */
-  public markerWorld(kind: LevelMarker['kind']): Vec2 | undefined {
-    const marker = this.data.markers.find((m) => m.kind === kind);
-    if (!marker) return undefined;
-    return Level.tileCenter(marker.tx, marker.ty);
+  /** All spawns of a given kind, in authoring order. */
+  public spawnsOf<K extends LevelSpawn['kind']>(kind: K): Extract<LevelSpawn, { kind: K }>[] {
+    return this.data.spawns.filter((s): s is Extract<LevelSpawn, { kind: K }> => s.kind === kind);
+  }
+
+  /** Player spawn as world px (tile center), or undefined if missing. */
+  public spawnPoint(): Vec2 | undefined {
+    const spawn = this.data.spawns.find((s) => s.kind === 'playerSpawn');
+    return spawn ? Level.tileCenter(spawn.tx, spawn.ty) : undefined;
+  }
+
+  /** First checkpoint world position, or undefined. */
+  public firstCheckpointWorld(): Vec2 | undefined {
+    const checkpoint = this.data.spawns.find((s) => s.kind === 'checkpoint');
+    return checkpoint ? Level.tileCenter(checkpoint.tx, checkpoint.ty) : undefined;
+  }
+
+  /** Exit world position, or undefined. */
+  public exitPoint(): Vec2 | undefined {
+    const exit = this.data.spawns.find((s) => s.kind === 'exit');
+    return exit ? Level.tileCenter(exit.tx, exit.ty) : undefined;
   }
 }
 
 // ------------------------------------------------------------------ parsing --
 
+/** Optional metadata for {@link parseAsciiLevel} (defaults keep it cheap for tests/tools). */
+export interface AsciiLevelMeta {
+  index?: number;
+  theme?: string;
+  intro?: string;
+  parTimeSeconds?: number;
+  fragmentTypes?: FragmentTypeName[];
+}
+
 /**
- * Build a {@link LevelData} from ASCII rows (see {@link ASCII_TILES}).
- * Rows are padded/truncated to the longest row; 'S'/'C'/'G' become markers.
+ * Build a {@link LevelData} from ASCII rows (see legend in LevelData.ts).
+ * Rows are padded/truncated to the longest row; tile characters become tiles
+ * and every other legend character becomes an entry on the spawn layer.
  */
 export function parseAsciiLevel(
   id: string,
   name: string,
   rows: readonly string[],
-  parTimeSeconds?: number,
+  meta: AsciiLevelMeta = {},
 ): LevelData {
   if (rows.length === 0) throw new Error(`Level "${id}": no rows`);
   const width = Math.max(...rows.map((r) => r.length));
 
   const tiles: TileType[][] = [];
-  const markers: LevelMarker[] = [];
+  const spawns: LevelSpawn[] = [];
 
   for (let y = 0; y < rows.length; y++) {
     const row = rows[y] ?? '';
     const gridRow: TileType[] = [];
     for (let x = 0; x < width; x++) {
       const ch = x < row.length ? (row[x] ?? '.') : '.';
-      const markerKind = ASCII_MARKERS[ch];
-      if (markerKind) {
-        markers.push({ kind: markerKind, tx: x, ty: y });
+      const spawnFactory = SPAWN_CHARS[ch];
+      if (spawnFactory) {
+        spawns.push(spawnFactory(x, y));
         gridRow.push(TileType.Empty);
         continue;
       }
@@ -130,5 +157,17 @@ export function parseAsciiLevel(
     tiles.push(gridRow);
   }
 
-  return { id, name, widthTiles: width, heightTiles: tiles.length, tiles, markers, parTimeSeconds };
+  return {
+    id,
+    index: meta.index ?? 0,
+    name,
+    theme: meta.theme ?? '',
+    intro: meta.intro ?? '',
+    parTimeSeconds: meta.parTimeSeconds ?? 60,
+    fragmentTypes: meta.fragmentTypes ?? [],
+    widthTiles: width,
+    heightTiles: tiles.length,
+    tiles,
+    spawns,
+  };
 }

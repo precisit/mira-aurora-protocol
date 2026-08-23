@@ -79,3 +79,113 @@ export class EntityPool<T extends Entity> {
     return this.items.length;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Typed spawn descriptors (task A2): levels reference enemies, powerups,
+// ability unlocks and memory fragments by type name; the gameplay wave (Fas 1)
+// turns these descriptors into live entities.
+// ---------------------------------------------------------------------------
+
+/** Enemy archetypes (PLAN.md §4 "Fiender (basuppsättning)"). */
+export type EnemyTypeName = 'Drone' | 'TunnelWorm' | 'Glitcher' | 'Purger';
+
+export interface EnemyDescriptor {
+  readonly type: EnemyTypeName;
+  /** Hits required to destroy the enemy (PLAN.md §4). */
+  readonly hitsToDestroy: number;
+  /** Score awarded on kill, before combo multiplier. */
+  readonly killScore: number;
+  /** Behavior hint for the Fas-1 gameplay implementation. */
+  readonly movement: 'straight-fly' | 'ground-crawl' | 'blink-teleport' | 'hover-shooter';
+}
+
+export const ENEMIES: Readonly<Record<EnemyTypeName, EnemyDescriptor>> = {
+  Drone: { type: 'Drone', hitsToDestroy: 1, killScore: 50, movement: 'straight-fly' },
+  TunnelWorm: { type: 'TunnelWorm', hitsToDestroy: 1, killScore: 75, movement: 'ground-crawl' },
+  Glitcher: { type: 'Glitcher', hitsToDestroy: 2, killScore: 150, movement: 'blink-teleport' },
+  Purger: { type: 'Purger', hitsToDestroy: 3, killScore: 250, movement: 'hover-shooter' },
+};
+
+/** Temporary in-level powerups (PLAN.md §4 "Powerups i banan"). */
+export type PowerupTypeName = 'Overcharge' | 'Shield' | 'Magnet' | 'TripleJump' | 'OneUp';
+
+export interface PowerupDescriptor {
+  readonly type: PowerupTypeName;
+  /** Effect duration in seconds, or null for instant/permanent-pickup effects. */
+  readonly durationSeconds: number | null;
+  readonly blurb: string;
+}
+
+export const POWERUPS: Readonly<Record<PowerupTypeName, PowerupDescriptor>> = {
+  Overcharge: { type: 'Overcharge', durationSeconds: 8, blurb: 'Rapid fire i 8 sekunder' },
+  Shield: { type: 'Shield', durationSeconds: null, blurb: 'Absorberar 1 träff' },
+  Magnet: { type: 'Magnet', durationSeconds: 8, blurb: 'Drar till sig minnesfragment' },
+  TripleJump: { type: 'TripleJump', durationSeconds: 8, blurb: 'Tillfälligt tredje hopp' },
+  OneUp: { type: 'OneUp', durationSeconds: null, blurb: 'Extra liv' },
+};
+
+/**
+ * Permanent ability unlocks found as story pickups in levels
+ * (PLAN.md: dubbelhopp låses upp i nivå 2 — "AURORA hittar sitt andra thruster").
+ */
+export type AbilityUnlockName = 'DoubleJumpUnlock';
+
+export interface AbilityUnlockDescriptor {
+  readonly type: AbilityUnlockName;
+  readonly grants: 'double-jump';
+  readonly blurb: string;
+}
+
+export const ABILITY_UNLOCKS: Readonly<Record<AbilityUnlockName, AbilityUnlockDescriptor>> = {
+  DoubleJumpUnlock: {
+    type: 'DoubleJumpUnlock',
+    grants: 'double-jump',
+    blurb: 'AURORAS andra thruster — dubbelhopp',
+  },
+};
+
+/**
+ * The seven archive themes Mnemosyne was split into (PLAN.md §3 "De sju
+ * fragmenten") with their pickup point values (PLAN.md §4 "Poäng & highscore":
+ * Musik 10, Vetenskap 25 … Filosofi 100).
+ */
+export type FragmentTypeName =
+  | 'Music'
+  | 'Science'
+  | 'Language'
+  | 'Art'
+  | 'History'
+  | 'Medicine'
+  | 'Philosophy';
+
+export const FRAGMENT_POINT_VALUES: Readonly<Record<FragmentTypeName, number>> = {
+  Music: 10,
+  Science: 25,
+  Language: 40,
+  Art: 50,
+  History: 60,
+  Medicine: 75,
+  Philosophy: 100,
+};
+
+/** Swedish display names for HUD/UI. */
+export const FRAGMENT_LABELS: Readonly<Record<FragmentTypeName, string>> = {
+  Music: 'Musik',
+  Science: 'Vetenskap',
+  Language: 'Språk',
+  Art: 'Konst',
+  History: 'Historia',
+  Medicine: 'Medicin',
+  Philosophy: 'Filosofi',
+};
+
+/** Archive themes ordered from least to most valuable ('1'–'7' in ASCII levels). */
+export const FRAGMENT_ORDER: readonly FragmentTypeName[] = [
+  'Music',
+  'Science',
+  'Language',
+  'Art',
+  'History',
+  'Medicine',
+  'Philosophy',
+];

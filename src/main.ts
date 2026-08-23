@@ -2,7 +2,7 @@ import { GameLoop } from './core/GameLoop';
 import { GameStateMachine, GameStateName } from './core/GameState';
 import { AudioEngine } from './audio/AudioEngine';
 import { InputAction, InputManager } from './input/InputManager';
-import { createTestLevel } from './levels/TestLevel';
+import { getLevel } from './levels/levels';
 import { Level } from './levels/Level';
 import { TILE_SIZE, TileType } from './levels/LevelData';
 import { ParallaxBackground } from './renderer/ParallaxBackground';
@@ -18,9 +18,9 @@ import './style.css';
 /**
  * Aurora Protocol — Fas 0 bootstrap.
  *
- * Boots the WebGPU renderer, generates the five parallax layers, loads the
- * test level and starts a fixed-timestep loop that slowly pans the camera
- * across it. Background + tiles are visible; the player entity arrives in
+ * Boots the WebGPU renderer, generates the five parallax layers, loads
+ * level 1 ("Mnemosynes fall") and starts a fixed-timestep loop that slowly
+ * pans the camera across it. Background + tiles are visible; the player entity arrives in
  * wave A. State machine: BOOT → MENU → (Space) PLAYING ⇄ PAUSED.
  */
 
@@ -34,6 +34,7 @@ const TINT_PLATFORM: Rgba = [1.0, 0.35, 0.85, 1];
 const TINT_HAZARD: Rgba = [1.0, 0.45, 0.15, 1];
 const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.8];
 const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.9];
+const TINT_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 0.8];
 
 interface DemoState {
   cameraX: number;
@@ -60,7 +61,7 @@ async function boot(): Promise<void> {
   const parallax = new ParallaxBackground(renderer);
   await parallax.generate();
 
-  const level = new Level(createTestLevel());
+  const level = new Level(getLevel(1));
   const input = new InputManager();
   input.attach(window);
   const audio = new AudioEngine();
@@ -118,14 +119,19 @@ async function boot(): Promise<void> {
       }
     }
 
-    // Checkpoints & goal as glowing markers so the data is visible in-demo.
-    for (const marker of level.data.markers) {
-      if (marker.kind === 'spawn') continue;
-      const tint = marker.kind === 'checkpoint' ? TINT_MARKER_CHECKPOINT : TINT_MARKER_GOAL;
+    // Spawn-layer entities as glowing markers so the data is visible in-demo.
+    for (const spawn of level.data.spawns) {
+      if (spawn.kind === 'playerSpawn') continue;
+      const tint =
+        spawn.kind === 'checkpoint'
+          ? TINT_MARKER_CHECKPOINT
+          : spawn.kind === 'exit'
+            ? TINT_MARKER_GOAL
+            : TINT_MARKER_PICKUP;
       const height = TILE_SIZE * 2;
       sprites.push({
-        x: Level.tileToWorldX(marker.tx) + 10 - demo.cameraX,
-        y: Level.tileToWorldY(marker.ty + 1) - height,
+        x: Level.tileToWorldX(spawn.tx) + 10 - demo.cameraX,
+        y: Level.tileToWorldY(spawn.ty + 1) - height,
         width: 12,
         height,
         tint,
