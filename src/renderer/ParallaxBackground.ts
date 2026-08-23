@@ -1,17 +1,21 @@
 import { SeededRng } from '../core/Rng';
-import { VIRTUAL_HEIGHT, type WebGPURenderer, type SpriteDraw } from './WebGPURenderer';
+import { VIRTUAL_HEIGHT, type SpriteDraw } from './types';
+import type { WebGPURenderer } from './WebGPURenderer';
 
 /**
- * Parallax background (PLAN.md §6): 5 procedurally generated layers,
- * drawn back-to-front. Each layer is rendered once into an offscreen canvas
- * (neon synthwave art via Canvas2D), uploaded to a GPU texture, then tiled
- * horizontally every frame at its own scroll factor.
+ * Parallax background (PLAN.md §6): 5 procedurally generated layers, drawn
+ * strictly back-to-front in depth order:
  *
- *   1. Nebula        — huge soft magenta/violet clouds (slowest)
- *   2. Starfield     — dense pin-sharp stars, occasional glow stars
- *   3. Celestial     — striped synthwave sun + ringed planet + moon
- *   4. Mid layer     — silhouette skyline/mountains with neon ridge lines
- *   5. Foreground    — sparse glowing pillars/grid near the bottom (fastest)
+ *   nebula → starfield → celestial bodies → mid skyline → foreground decor
+ *
+ * Each layer is rendered once into an offscreen canvas (neon synthwave art
+ * via Canvas2D), uploaded to a GPU texture, then tiled horizontally every
+ * frame at its own scroll factor. A1 polish:
+ *   - camera offsets are exponentially smoothed (no jitter on teleports),
+ *   - tiling wraps seamlessly for any camera position,
+ *   - layers carry explicit depth + a slow ambient drift so the sky feels
+ *     alive even when the player stands still,
+ *   - the foreground layer renders additively (neon glass over gameplay).
  *
  * Deterministic: all randomness comes from SeededRng, so the sky looks
  * identical on every device/run.
@@ -25,23 +29,81 @@ export enum ParallaxLayerName {
   Foreground = 'parallax-foreground',
 }
 
-interface LayerSpec {
+export interface ParallaxLayerSpec {
   name: ParallaxLayerName;
+  /** Draw order: smaller depth = further back. Gameplay lives at ~50. */
+  depth: number;
   /** World-px scrolled per world-px of camera movement (0 = static). */
   scrollFactor: number;
   /** Horizontal period in virtual px — one texture spans exactly this much. */
   tileWidth: number;
   /** Opacity of the whole layer. */
   alpha: number;
+  /** Constant ambient drift in virtual px/s (adds life when standing still). */
+  driftPxPerSec: number;
+  /** Render with premultiplied additive blending. */
+  additive?: boolean;
 }
 
-const LAYERS: readonly LayerSpec[] = [
-  { name: ParallaxLayerName.Nebula, scrollFactor: 0.05, tileWidth: 2048, alpha: 0.9 },
-  { name: ParallaxLayerName.Starfield, scrollFactor: 0.12, tileWidth: 1536, alpha: 1 },
-  { name: ParallaxLayerName.Celestial, scrollFactor: 0.22, tileWidth: 1920, alpha: 1 },
-  { name: ParallaxLayerName.Mid, scrollFactor: 0.45, tileWidth: 1280, alpha: 1 },
-  { name: ParallaxLayerName.Foreground, scrollFactor: 0.85, tileWidth: 960, alpha: 0.55 },
+/** Depth-sorted layer table — PLAN.md's five bands, back to front. */
+export const PARALLAX_LAYERS: readonly ParallaxLayerSpec[] = [
+  { name: ParallaxLayerName.Nebula, depth: 10, scrollFactor: 0.05, tileWidth: 2048, alpha: 0.9, driftPxPerSec: 4 },
+  { name: ParallaxLayerName.Starfield, depth: 20, scrollFactor: 0.12, tileWidth: 1536, alpha: 1, driftPxPerSec: 1.5 },
+  { name: ParallaxLayerName.Celestial, depth: 30, scrollFactor: 0.22, tileWidth: 1920, alpha: 1, driftPxPerSec: 2.5 },
+  { name: ParallaxLayerName.Mid, depth: 40, scrollFactor: 0.45, tileWidth: 1280, alpha: 1, driftPxPerSec: 0 },
+  { name: ParallaxLayerName.Foreground, depth: 90, scrollFactor: 0.85, tileWidth: 960, alpha: 0.5, driftPxPerSec: 0, additive: true },
 ];
+
+/** Camera smoothing response time in seconds (lower = snappier). */
+const SMOOTHING_RESPONSE_SECONDS = 0.08;
+/** Max simulated frame gap; guards against tab-switch time jumps. */
+const MAX_FRAME_SECONDS = 0.1;
+
+/**
+ * Wrap `value` into [0, period) — handles negatives and non-finite input.
+ * Guarantees seamless horizontal looping of parallax tiles.
+ */
+export function wrapPeriod(value: number, period: number): number {
+  if (!Number.isFinite(value) || !(period > 0)) return 0;
+  return ((value % period) + period) % period;
+}
+
+/**
+ * X positions of tiles covering [left, right) given a tile width and the
+ * wrapped scroll offset. Always returns enough tiles to cover the full view
+ * (first tile starts at or left of `left`, last extends past `right`).
+ */
+export function computeTilePositions(
+  left: number,
+  right: number,
+  tileWidth: number,
+  offset: number,
+): number[] {
+  if (!(tileWidth > 0) || !Number.isFinite(left) || !Number.isFinite(right)) return [];
+  if (!(right > left)) return [];
+  const off = wrapPeriod(offset, tileWidth);
+  const positions: number[] = [];
+  for (let x = left - off; x < right; x += tileWidth) {
+    positions.push(x);
+  }
+  return positions;
+}
+
+/**
+ * Frame-rate-independent exponential smoothing toward a target.
+ * Returns `current` unchanged for degenerate dt/response values.
+ */
+export function smoothTowards(
+  current: number,
+  target: number,
+  dtSeconds: number,
+  responseSeconds: number,
+): number {
+  if (!Number.isFinite(dtSeconds) || dtSeconds <= 0) return current;
+  if (!Number.isFinite(responseSeconds) || responseSeconds <= 0) return current;
+  const alpha = 1 - Math.exp(-dtSeconds / responseSeconds);
+  return current + (target - current) * alpha;
+}
 
 type GenCanvas = OffscreenCanvas | HTMLCanvasElement;
 type GenCtx = OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D;
@@ -260,12 +322,29 @@ function generateForeground(width: number, height: number): GenCanvas {
   return canvas;
 }
 
+const GENERATORS: ReadonlyArray<(width: number, height: number) => GenCanvas> = [
+  generateNebula,
+  generateStarfield,
+  generateCelestial,
+  generateMidLayer,
+  generateForeground,
+];
+
 // --------------------------------------------------------------- component ---
 
 export class ParallaxBackground {
+  private readonly renderer: WebGPURenderer;
   private generated = false;
 
-  public constructor(private readonly renderer: WebGPURenderer) {}
+  /** Smoothed camera position actually used for scrolling. */
+  private smoothedCameraX = 0;
+  private lastFrameMs: number | null = null;
+  /** Accumulated ambient drift phase per layer (virtual px). */
+  private driftPhases = PARALLAX_LAYERS.map(() => 0);
+
+  public constructor(renderer: WebGPURenderer) {
+    this.renderer = renderer;
+  }
 
   /**
    * Procedurally generate all five layers as offscreen canvases and upload
@@ -274,56 +353,70 @@ export class ParallaxBackground {
   public async generate(): Promise<void> {
     if (this.generated) return;
 
-    const generators: ReadonlyArray<(width: number, height: number) => GenCanvas> = [
-      generateNebula,
-      generateStarfield,
-      generateCelestial,
-      generateMidLayer,
-      generateForeground,
-    ];
-
     // Yield to the event loop between uploads so first paint stays responsive.
-    for (let i = 0; i < LAYERS.length; i++) {
-      const layer = LAYERS[i];
-      const generate = generators[i];
+    for (let i = 0; i < PARALLAX_LAYERS.length; i++) {
+      const layer = PARALLAX_LAYERS[i];
+      const generate = GENERATORS[i];
       if (!layer || !generate) continue;
       await Promise.resolve();
       this.renderer.createTextureFromCanvas(layer.name, generate(layer.tileWidth, VIRTUAL_HEIGHT));
     }
 
     this.generated = true;
+    this.lastFrameMs = null; // don't integrate a giant dt on the first frame
   }
 
   /**
-   * Tile every layer across the current view bounds (which include side
-   * gutters on wider screens). `cameraX` is the gameplay camera's world
-   * position; each layer advances by `cameraX * scrollFactor`.
+   * Draw every layer across the current view bounds (which include side
+   * gutters on wider screens), back-to-front in depth order.
+   *
+   * `cameraX` is the gameplay camera's world position; it is treated as the
+   * smoothing *target*, and each layer advances by
+   * `smoothedCameraX * scrollFactor + ambientDriftPhase`.
    */
-  public draw(cameraX: number): void {
+  public draw(cameraX?: number): void {
     if (!this.generated) return;
+
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    let frameSeconds = 1 / 60;
+    if (this.lastFrameMs !== null) {
+      frameSeconds = Math.min(Math.max((nowMs - this.lastFrameMs) / 1000, 0), MAX_FRAME_SECONDS);
+    }
+    this.lastFrameMs = nowMs;
+
+    const target = typeof cameraX === 'number' && Number.isFinite(cameraX) ? cameraX : this.smoothedCameraX;
+    this.smoothedCameraX = smoothTowards(
+      this.smoothedCameraX,
+      target,
+      frameSeconds,
+      SMOOTHING_RESPONSE_SECONDS,
+    );
 
     const bounds = this.renderer.viewBounds;
     const viewHeight = bounds.bottom - bounds.top;
 
-    for (const layer of LAYERS) {
+    for (let i = 0; i < PARALLAX_LAYERS.length; i++) {
+      const layer = PARALLAX_LAYERS[i];
+      if (!layer) continue;
       const size = this.renderer.textureSize(layer.name);
       if (!size) continue;
 
-      // Wrap the scroll offset into [0, tileWidth) so tiling is seamless
-      // for both positive and negative camera positions.
-      const rawOffset = cameraX * layer.scrollFactor;
-      const offset = ((rawOffset % layer.tileWidth) + layer.tileWidth) % layer.tileWidth;
+      this.driftPhases[i] = (this.driftPhases[i] ?? 0) + layer.driftPxPerSec * frameSeconds;
+      const rawOffset = this.smoothedCameraX * layer.scrollFactor + (this.driftPhases[i] ?? 0);
+      const offset = wrapPeriod(rawOffset, layer.tileWidth);
 
-      const tiles: SpriteDraw[] = [];
-      for (let x = bounds.left - offset; x < bounds.right; x += layer.tileWidth) {
-        tiles.push({
-          x,
-          y: bounds.top,
-          width: layer.tileWidth,
-          height: viewHeight,
-          tint: [1, 1, 1, layer.alpha],
-        });
-      }
+      const xs = computeTilePositions(bounds.left, bounds.right, layer.tileWidth, offset);
+      if (xs.length === 0) continue;
+
+      const blend: SpriteDraw['blend'] = layer.additive ? 'additive' : 'normal';
+      const tiles: SpriteDraw[] = xs.map((x) => ({
+        x,
+        y: bounds.top,
+        width: layer.tileWidth,
+        height: viewHeight,
+        tint: [1, 1, 1, layer.alpha],
+        blend,
+      }));
       this.renderer.drawSprites(layer.name, tiles);
     }
   }
