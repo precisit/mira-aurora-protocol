@@ -1,5 +1,6 @@
 import { GameLoop } from './core/GameLoop';
 import { GameStateMachine, GameStateName } from './core/GameState';
+import { attachLevelTimer, LevelTimer } from './core/Timer';
 import { AudioEngine } from './audio/AudioEngine';
 import { InputAction, InputManager } from './input/InputManager';
 import { getLevel } from './levels/levels';
@@ -73,8 +74,13 @@ async function boot(): Promise<void> {
   const audio = new AudioEngine();
   audio.applySettings(save.load().settings); // persisted volumes (SaveStore hook)
   const detachAudioUnlock = audio.initOnInteraction(window, () => audio.playSfx('ui-click'));
-  const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
+   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
   const state = new GameStateMachine();
+  // Task B5: level + total run clocks, kept in sync with the state machine
+  // (MENU→PLAYING starts the run, PAUSED pauses, GAMEOVER restarts the level
+  // clock while total keeps accumulating — speedrun rules per PLAN.md §4).
+  const timer = new LevelTimer();
+  const detachTimerSync = attachLevelTimer(state, timer);
   state.transition(GameStateName.Menu); // assets are ready → show menu
 
   const demo: DemoState = { cameraX: 0, cameraDir: 1 };
@@ -159,6 +165,9 @@ async function boot(): Promise<void> {
   // ---- Fixed-timestep loop --------------------------------------------------
   const loop = new GameLoop({
     update(stepMs) {
+      // Clocks only accumulate while PLAYING (timer guards internally).
+      timer.advance(stepMs);
+
       // Edge-triggered actions drive the state machine.
       if (
         state.current === GameStateName.Menu &&
@@ -208,6 +217,8 @@ async function boot(): Promise<void> {
         levelName: level.data.name,
         fps: loop.fps,
         cameraX: demo.cameraX,
+        timeText: timer.formatLevelTime(),
+        totalTimeText: timer.formatTotalTime(),
         message: stateMessage(state.current),
       });
     },
@@ -217,6 +228,7 @@ async function boot(): Promise<void> {
     loop.stop();
     input.detach();
     detachAudioUnlock();
+    detachTimerSync();
     audio.dispose();
     hud.destroy();
   });

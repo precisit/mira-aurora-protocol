@@ -29,6 +29,12 @@ export interface SaveData {
   highscores: Record<string, HighscoreEntry>;
   /** Accumulated across all runs; unlocks weapons, never decreases. */
   totalScore: number;
+  /**
+   * Fastest complete campaign run (level 1→7), in ms — speedrun best per
+   * PLAN.md §4 "Vinst & replay". null until a first full run is finished.
+   * Additive field (B5): older save blobs without it load as null.
+   */
+  bestRunTimeMs: number | null;
   unlockedWeapons: string[];
   settings: GameSettings;
 }
@@ -46,6 +52,7 @@ export function defaultSaveData(): SaveData {
     version: 1,
     highscores: {},
     totalScore: 0,
+    bestRunTimeMs: null,
     unlockedWeapons: ['puls'], // starting weapon
     settings: { volume: 0.8, sfxVolume: 0.9, musicVolume: 0.7, fpsCap: null },
   };
@@ -118,6 +125,18 @@ export class SaveStore {
     return data;
   }
 
+  /**
+   * Records the total time of a completed campaign run; keeps the fastest.
+   * Returns true when it is a new best-run record (false for non-finishes,
+   * i.e. `runTimeMs <= 0`, or slower times).
+   */
+  public recordRunTime(data: SaveData, runTimeMs: number): boolean {
+    if (!(runTimeMs > 0)) return false;
+    if (data.bestRunTimeMs !== null && runTimeMs >= data.bestRunTimeMs) return false;
+    data.bestRunTimeMs = runTimeMs;
+    return true;
+  }
+
   /** Weapon unlock by accumulated total score; idempotent. */
   public unlockWeapon(data: SaveData, weaponId: string): boolean {
     if (data.unlockedWeapons.includes(weaponId)) return false;
@@ -134,6 +153,11 @@ export class SaveStore {
           ? (parsed.highscores as Record<string, HighscoreEntry>)
           : fallback.highscores,
       totalScore: typeof parsed.totalScore === 'number' ? parsed.totalScore : 0,
+      // Additive (B5): old blobs lack bestRunTimeMs — treat junk as "no run yet".
+      bestRunTimeMs:
+        typeof parsed.bestRunTimeMs === 'number' && parsed.bestRunTimeMs > 0
+          ? parsed.bestRunTimeMs
+          : null,
       unlockedWeapons: Array.isArray(parsed.unlockedWeapons)
         ? parsed.unlockedWeapons
         : fallback.unlockedWeapons,
