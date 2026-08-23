@@ -25,7 +25,8 @@ export type SfxName =
   | 'checkpoint'
   | 'boss-warning'
   | 'ui-click'
-  | 'combo-tick';
+  | 'combo-tick'
+  | 'intro-sting';
 
 /** Optional per-call tweaks (e.g. combo pitch ladder step). */
 export interface SfxOptions {
@@ -288,6 +289,31 @@ const comboTickSfx: SfxSynthFn = (kit, out, when, options) => {
   blip(kit, out, when, { type: 'sine', fromFreq: freq, toFreq: freq, durationMs: 45, gain: 0.05 });
 };
 
+/** Intro sting: soft rising C-fifth pad with a shimmer tail (B4 intro). */
+const introStingSfx: SfxSynthFn = (kit, out, when) => {
+  const chord = [261.63, 392.0, 523.25];
+  chord.forEach((freq, index) => {
+    blip(kit, out, when, {
+      type: 'triangle',
+      fromFreq: freq,
+      toFreq: freq,
+      durationMs: 900,
+      gain: 0.04,
+      attackMs: 160,
+      delayMs: index * 110,
+    });
+  });
+  blip(kit, out, when, {
+    type: 'sine',
+    fromFreq: 1046.5,
+    toFreq: 2093.0,
+    durationMs: 700,
+    gain: 0.02,
+    attackMs: 200,
+    delayMs: 360,
+  });
+};
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -304,6 +330,7 @@ export const SFX_SYNTHS: Readonly<Record<SfxName, SfxSynthFn>> = {
   'boss-warning': bossWarningSfx,
   'ui-click': uiClickSfx,
   'combo-tick': comboTickSfx,
+  'intro-sting': introStingSfx,
 };
 
 export const ALL_SFX_NAMES: readonly SfxName[] = Object.keys(SFX_SYNTHS) as SfxName[];
