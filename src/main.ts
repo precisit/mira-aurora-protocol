@@ -1,6 +1,8 @@
 import { GameLoop } from './core/GameLoop';
 import { GameStateMachine, GameStateName } from './core/GameState';
+import { attachLevelTimer, LevelTimer } from './core/Timer';
 import { AudioEngine } from './audio/AudioEngine';
+import { JuiceSystem } from './effects/JuiceSystem';
 import { InputAction, InputManager } from './input/InputManager';
 import { CAMPAIGN_LEVELS } from './levels/levels';
 import { Level } from './levels/Level';
@@ -32,7 +34,14 @@ import './style.css';
  * {@link GameSession} (player, enemies, projectiles, pickups, checkpoints).
  * State machine: BOOT → MENU → (Space) PLAYING ⇄ PAUSED / → GAMEOVER →
  * PLAYING … → WIN → MENU. Camera follows AURORA; HUD shows score/lives/
- * weapon/combo; procedural SFX fire on gameplay events.
+ * weapon/combo plus the B5 level/total clocks and the B1 juice telemetry;
+ * procedural SFX fire on gameplay events.
+ *
+ * B1 juice (PLAN.md §4 "Juice & effekter") routes through {@link JuiceSystem},
+ * the shared effects façade: jump/land/shoot are observed from the player
+ * each step, and gameplay events drive the particle/shake/bloom recipes.
+ * Screen shake offsets the camera transform; a fullscreen additive quad
+ * renders the death/explosion screen flash.
  */
 
 // Neon palette (tints over the white 1×1 texture).
@@ -99,7 +108,33 @@ async function boot(): Promise<void> {
 
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
   const state = new GameStateMachine();
+  // Task B5: level + total run clocks, kept in sync with the state machine
+  // (MENU→PLAYING starts the run, PAUSED pauses, GAMEOVER restarts the level
+  // clock while total keeps accumulating — speedrun rules per PLAN.md §4).
+  const timer = new LevelTimer();
+  const detachTimerSync = attachLevelTimer(state, timer);
   state.transition(GameStateName.Menu);
+
+  // ---- B1 juice -------------------------------------------------------------
+  const juice = new JuiceSystem({
+    setBloom: (patch) => renderer.setBloomOptions(patch),
+  });
+
+  /** Fullscreen additive quad while the screen-flash envelope is active. */
+  const flashQuad: SpriteDraw[] = [{ x: 0, y: 0, width: 0, height: 0 }];
+  const flashColor: [number, number, number, number] = [1, 1, 1, 0];
+  const drawScreenFlash = (): void => {
+    if (!juice.screenFlash.isActive) return;
+    const bounds = renderer.viewBounds;
+    const quad = flashQuad[0]!;
+    quad.x = bounds.left;
+    quad.y = bounds.top;
+    quad.width = bounds.right - bounds.left;
+    quad.height = bounds.bottom - bounds.top;
+    quad.tint = juice.screenFlash.currentColor(flashColor);
+    quad.blend = 'additive';
+    renderer.drawSprites('white', flashQuad);
+  };
 
   // ---- Gameplay bookkeeping -------------------------------------------------
   let levelIndex = 1;
@@ -127,10 +162,46 @@ async function boot(): Promise<void> {
     });
     if (carriedDoubleJump) session.player.abilities.doubleJumpUnlocked = true;
     levelFinished = false;
+    timer.restartLevel(); // fresh attempt → per-level clock back to 00:00.00
+    prevPlayerGrounded = true;
+    prevPlayerVy = 0;
+    prevProjectileCount = 0;
     void audio.playMusic(data.id);
   };
 
   function handleGameEvent(event: GameEvent): void {
+    // B1 juice recipes keyed off gameplay events (positions approximate the
+    // player anchor unless the event carries its own coordinates).
+    if (session) {
+      const p = session.player;
+      switch (event.type) {
+        case 'fragment-collected':
+          juice.fragmentPickup(p.centerX, p.centerY);
+          break;
+        case 'enemy-killed':
+          juice.enemyDeath(p.centerX, p.centerY);
+          break;
+        case 'player-died':
+          juice.playerDeath(p.centerX, p.centerY);
+          break;
+        case 'checkpoint-activated':
+          juice.shake.addTrauma(0.22);
+          juice.bloom.pulse(0.35);
+          break;
+        case 'powerup-collected':
+          juice.bloom.pulse(0.3);
+          break;
+        case 'unlock-granted':
+          juice.bloom.pulse(0.55);
+          break;
+        case 'level-complete':
+          juice.bloom.pulse(0.6);
+          break;
+        default:
+          break;
+      }
+    }
+
     switch (event.type) {
       case 'checkpoint-activated':
         showToast(`CHECKPOINT · +${CHECKPOINT_BONUS}`);
@@ -154,6 +225,41 @@ async function boot(): Promise<void> {
   function campaignLevel(index: number) {
     return CAMPAIGN_LEVELS.find((l) => l.index === index);
   }
+
+  // ---- B1 continuous juice observers ---------------------------------------
+  // Player state from the previous fixed step, used to detect jump/land
+  // edges and newly fired projectiles (the session exposes no dedicated
+  // hooks for those moments).
+  let prevPlayerGrounded = true;
+  let prevPlayerVy = 0;
+  let prevProjectileCount = 0;
+  let lastAimX = 1;
+  let lastAimY = 0;
+
+  const applyGameplayJuice = (): void => {
+    if (!session) return;
+    const p = session.player;
+
+    const shotCount = session.activeProjectiles.length;
+    if (shotCount > prevProjectileCount) {
+      const len = Math.hypot(lastAimX, lastAimY) || 1;
+      juice.shoot(
+        p.centerX + (lastAimX / len) * 16,
+        p.centerY + (lastAimY / len) * 16,
+        Math.atan2(lastAimY, lastAimX),
+      );
+    }
+    prevProjectileCount = shotCount;
+
+    if (!prevPlayerGrounded && p.grounded) {
+      const impact = Math.min(2, Math.abs(prevPlayerVy) / 700);
+      juice.land(p.centerX, p.centerY + p.height / 2, impact);
+    } else if (prevPlayerGrounded && !p.grounded && p.vy < 0) {
+      juice.jump(p.centerX, p.centerY + p.height / 2);
+    }
+    prevPlayerGrounded = p.grounded;
+    prevPlayerVy = p.vy;
+  };
 
   // Per-frame input latches: fixed-step updates may run 0..N times per frame,
   // so edge-triggered actions are captured once and explicitly consumed.
@@ -202,6 +308,13 @@ async function boot(): Promise<void> {
       const len = Math.hypot(dx, dy);
       if (len > 8) aim = { x: dx / len, y: dy / len };
     }
+    if (aim) {
+      lastAimX = aim.x;
+      lastAimY = aim.y;
+    } else if (moveX !== 0) {
+      lastAimX = moveX;
+      lastAimY = 0;
+    }
 
     return {
       moveX,
@@ -229,13 +342,24 @@ async function boot(): Promise<void> {
     } else {
       state.transition(GameStateName.Win);
       audio.stopMusic();
-      showToast(`ARCHIVE RESTORED — TOTAL ${save.load().totalScore}`, 6000);
+      // Task B5: bank the speedrun total (fastest complete campaign run wins).
+      const runSaveData = save.load();
+      const isNewBestRun = save.recordRunTime(runSaveData, timer.totalElapsedMs);
+      save.save(audio.captureVolumesInto(runSaveData));
+      showToast(
+        `ARCHIVE RESTORED — TOTAL ${runSaveData.totalScore}` +
+          (isNewBestRun ? ' · NEW BEST RUN TIME!' : ''),
+        6000,
+      );
     }
   }
 
   // ---- Fixed-timestep loop --------------------------------------------------
   const loop = new GameLoop({
     update(stepMs) {
+      // Clocks only accumulate while PLAYING (timer guards internally).
+      timer.advance(stepMs);
+
       // ---- state machine (edge-latched so multi-step frames can't toggle) --
       switch (state.current) {
         case GameStateName.Menu:
@@ -292,8 +416,13 @@ async function boot(): Promise<void> {
           handleLevelProgression();
         } else {
           session.update(stepMs, buildPlayerInput());
+          applyGameplayJuice();
         }
       }
+
+      // B1 envelopes decay in every state so flashes/shake settle gracefully
+      // across pause/game-over transitions.
+      juice.update(stepMs / 1000);
 
       input.endFrame();
     },
@@ -301,13 +430,21 @@ async function boot(): Promise<void> {
     render() {
       refreshLatches();
 
-      renderer.beginFrame([0.03, 0.01, 0.09, 1]);
+      // B1 screen shake rides the camera transform: everything world-space
+      // (parallax pan + tiles/entities) shifts by the trauma noise; the DOM
+      // HUD stays steady.
       const cameraX = session?.cameraX ?? 0;
-      parallax.draw(cameraX);
+      const panX = cameraX - juice.shake.offsetX;
+      const offsetY = juice.shake.offsetY;
+
+      renderer.beginFrame([0.03, 0.01, 0.09, 1]);
+      parallax.draw(panX);
 
       if (session) {
-        renderer.drawSprites('white', buildWorldSprites(renderer, session));
+        renderer.drawSprites('white', buildWorldSprites(renderer, session, panX, offsetY));
+        renderer.drawSprites('white', juice.particles.buildDraws());
       }
+      drawScreenFlash();
       renderer.endFrame();
 
       hud.update({
@@ -321,6 +458,9 @@ async function boot(): Promise<void> {
         weapon: session ? 'PULS' : undefined,
         comboMultiplier: session?.score.multiplier,
         timeSeconds: session ? session.timeMs / 1000 : undefined,
+        timeText: timer.formatLevelTime(),
+        totalTimeText: timer.formatTotalTime(),
+        juiceLine: juice.statsLine(),
       });
     },
   });
@@ -349,6 +489,7 @@ async function boot(): Promise<void> {
     canvas.removeEventListener('pointermove', onPointerMove);
     detachTouchUi();
     detachAudioUnlock();
+    detachTimerSync();
     audio.dispose();
     hud.destroy();
   });
@@ -358,22 +499,25 @@ async function boot(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// World rendering: tiles + entities as batched neon sprites.
+// World rendering: tiles + entities as batched neon sprites. `panX` is the
+// (shake-modified) camera X; `offsetY` is the shake Y applied to every world
+// sprite so vertical trauma moves the gameplay layer too.
 // ---------------------------------------------------------------------------
 
 function buildWorldSprites(
   renderer: WebGPURenderer,
   session: GameSession,
+  panX: number,
+  offsetY: number,
 ): SpriteDraw[] {
   const sprites: SpriteDraw[] = [];
   const level = session.level;
-  const camX = session.cameraX;
-  const camY = session.cameraY;
+  const camY = session.cameraY + offsetY;
   const bounds = renderer.viewBounds;
 
   // --- tiles ---------------------------------------------------------------
-  const worldLeft = camX + bounds.left;
-  const worldRight = camX + bounds.right;
+  const worldLeft = panX + bounds.left;
+  const worldRight = panX + bounds.right;
   const tx0 = Math.max(0, Math.floor(worldLeft / TILE_SIZE));
   const tx1 = Math.min(level.widthTiles - 1, Math.ceil(worldRight / TILE_SIZE));
   if (tx1 >= tx0) {
@@ -383,7 +527,7 @@ function buildWorldSprites(
       for (let tx = tx0; tx <= tx1; tx++) {
         const tile = level.tileAt(tx, ty);
         if (tile === TileType.Empty) continue;
-        const x = Level.tileToWorldX(tx) - camX;
+        const x = Level.tileToWorldX(tx) - panX;
         switch (tile) {
           case TileType.Solid:
             sprites.push({
@@ -415,7 +559,7 @@ function buildWorldSprites(
   // --- checkpoints & exit ---------------------------------------------------
   for (const checkpoint of session.checkpoints) {
     sprites.push({
-      x: checkpoint.worldX + 10 - camX,
+      x: checkpoint.worldX + 10 - panX,
       y: checkpoint.worldY - 32 - camY,
       width: 12,
       height: 64,
@@ -427,7 +571,7 @@ function buildWorldSprites(
   const exit = session.exitBoxOrNull;
   if (exit) {
     sprites.push({
-      x: exit.x - camX,
+      x: exit.x - panX,
       y: exit.y - camY,
       width: exit.width,
       height: exit.height,
@@ -441,7 +585,7 @@ function buildWorldSprites(
   for (const pickup of session.activePickups) {
     const color = pickupColor(pickup);
     sprites.push({
-      x: pickup.position.x - camX,
+      x: pickup.position.x - panX,
       y: pickup.position.y - camY,
       width: pickup.size.x,
       height: pickup.size.y,
@@ -457,7 +601,7 @@ function buildWorldSprites(
     const flashing = enemy.hitFlashMs > 0;
     const tint: Rgba = flashing ? [1, 1, 1, 1] : base;
     sprites.push({
-      x: enemy.position.x - camX,
+      x: enemy.position.x - panX,
       y: enemy.position.y - camY,
       width: enemy.size.x,
       height: enemy.size.y,
@@ -472,7 +616,7 @@ function buildWorldSprites(
     p.isInvulnerable && Math.floor(session.timeMs / 80) % 2 === 1;
   if (!blinkHidden) {
     sprites.push({
-      x: p.x - 3 - camX,
+      x: p.x - 3 - panX,
       y: p.y - 3 - camY,
       width: p.width + 6,
       height: p.height + 6,
@@ -481,14 +625,14 @@ function buildWorldSprites(
       blend: 'additive',
     });
     sprites.push({
-      x: p.x - camX,
+      x: p.x - panX,
       y: p.y - camY,
       width: p.width,
       height: p.height,
       tint: PLAYER_COLOR,
     });
     sprites.push({
-      x: p.centerX - 4 - camX,
+      x: p.centerX - 4 - panX,
       y: p.centerY - 4 - camY,
       width: 8,
       height: 8,
@@ -500,7 +644,7 @@ function buildWorldSprites(
 
   // --- projectiles ----------------------------------------------------------------
   const projectileSprites: SpriteDraw[] = session.activeProjectiles.map((shot: Projectile) => ({
-    x: shot.position.x - camX,
+    x: shot.position.x - panX,
     y: shot.position.y - camY,
     width: shot.size.x,
     height: shot.size.y,
@@ -512,7 +656,7 @@ function buildWorldSprites(
 
   // --- particles --------------------------------------------------------------------
   const particleSprites: SpriteDraw[] = session.particles.active.map((particle: Particle) => ({
-    x: particle.x - particle.sizePx / 2 - camX,
+    x: particle.x - particle.sizePx / 2 - panX,
     y: particle.y - particle.sizePx / 2 - camY,
     width: particle.sizePx,
     height: particle.sizePx,

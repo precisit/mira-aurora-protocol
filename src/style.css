@@ -118,6 +118,14 @@ body {
   border-color: var(--neon-pink);
 }
 
+/* B1 juice telemetry (particles / shake / bloom). */
+.hud-juice {
+  color: #b6ffcf;
+  text-shadow:
+    0 0 6px rgba(182, 255, 207, 0.55),
+    0 0 14px rgba(65, 246, 255, 0.3);
+}
+
 /* ---- WebGPU fallback page -------------------------------------------- */
 
 #fallback {
