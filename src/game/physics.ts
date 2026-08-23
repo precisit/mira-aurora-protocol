@@ -26,3 +26,19 @@ export const COYOTE_TIME_MS = 90;
 
 /** Buffer window for jump presses executed slightly before landing. */
 export const JUMP_BUFFER_MS = 120;
+
+/**
+ * Extra downward acceleration while rising with the jump key released
+ * ("jump cut") so tap-jumps are shorter than held jumps — arcade tightness.
+ */
+export const JUMP_CUT_GRAVITY_SCALE = 1.9;
+
+/** Horizontal pushback applied to a body when damaged (small knockback). */
+export const HIT_KNOCKBACK_PX_PER_S = 220;
+
+/** Invulnerability window after taking damage (blink time), ms. */
+export const INVULNERABLE_MS = 1200;
+
+/** Shorter grace after a shield absorbs a hit, ms. */
+export const SHARED_SHIELD_IFRAME_MS = 600;
+
