@@ -4,7 +4,12 @@
  * Desktop keyboard:
  *   ←/→ or A/D .... move        Space/W/↑ ... jump
  *   J or X ........ shoot       K or C ...... swap weapon
- *   P or Esc ...... pause       Enter ....... confirm/start
+ *   P/Esc ......... pause       Enter ....... confirm/start
+ *
+ * Menu navigation (C1 meta layer): ↑/W = up, ↓/S = down,
+ * Backspace/Esc = back. The up/down actions ride along on keys that already
+ * have gameplay meanings (W/↑ also jump) so no key changes role between
+ * gameplay and menus — consumers simply read different actions per state.
  *
  * Touch: multi-touch virtual buttons are supported via `bindTouchButton`
  * (pointer events per element — one pointer per finger, so simultaneous
@@ -20,6 +25,9 @@ export enum InputAction {
   SwapWeapon = 'swap-weapon',
   Pause = 'pause',
   Confirm = 'confirm',
+  MenuUp = 'menu-up',
+  MenuDown = 'menu-down',
+  MenuBack = 'menu-back',
 }
 
 /** KeyboardEvent.code → actions (layout independent). */
@@ -29,8 +37,11 @@ const KEY_MAP: Readonly<Record<string, readonly InputAction[]>> = {
   ArrowRight: [InputAction.Right],
   KeyD: [InputAction.Right],
   Space: [InputAction.Jump],
-  KeyW: [InputAction.Jump],
-  ArrowUp: [InputAction.Jump],
+  KeyW: [InputAction.Jump, InputAction.MenuUp],
+  ArrowUp: [InputAction.Jump, InputAction.MenuUp],
+  KeyS: [InputAction.MenuDown],
+  ArrowDown: [InputAction.MenuDown],
+  Backspace: [InputAction.MenuBack],
   KeyJ: [InputAction.Shoot],
   KeyX: [InputAction.Shoot],
   KeyK: [InputAction.SwapWeapon],
