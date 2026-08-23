@@ -4,22 +4,21 @@ import { TileType } from './LevelData';
 import { LevelBuilder } from './LevelBuilder';
 
 /**
- * Nivå 7 — "Utpost Aurora" (task B2 test arena).
+ * Nivå 7 — "Utpost Aurora" (tema: finalen; task C2 — full nivå, ersätter
+ * B2-ståplatsen).
  *
- * Minimal final level: the last approach to Outpost Aurora, then NULL —
- * queen of pure absence. Stands in for the real PLAN.md §4 level 7 until the
- * content wave builds it; the `kind: 'boss'` arena descriptor and all
- * GameSession wiring are final, so replacing this with an authored level is
- * purely a data change.
- *
- * Geometry mirrors the vault arena but opens into the uplink platform: after
- * NULL falls, AURORA reaches the exit (the "hop" itself arrives with Fas 3).
+ * Finalens form: den hoppfulla uppstigningen. Breda, generösa plattformar i
+ * varmt ljus — minneslustgården, Vandringsplattformen, Utsiktsplattformen med
+ * 1-up och trippelhopp inför det sista hoppet — sedan Faltet ner till porten,
+ * skyddsvallen och slutstriden. Arenaraden är oförändrad från B2
+ * (`LEVEL07_ARENA`, exit på (72,20)): NULL vaktar dörren, och först när
+ * frånvaron faller öppnas vägen till upplänken.
  */
 
 const WIDTH = 76;
 const HEIGHT = 24;
 
-/** Arena tile rect — also exported for tests. */
+/** Arena tile rect — UNCHANGED from the B2 stand-in; also exported for tests. */
 export const LEVEL07_ARENA = { tx0: 36, ty0: 5, tx1: 75, ty1: 20 } as const;
 
 export function buildLevel07(): LevelData {
@@ -28,22 +27,33 @@ export function buildLevel07(): LevelData {
   // --- Mark --------------------------------------------------------------------
   b.ground(0, WIDTH - 1);
 
-  // --- Sista sträckan: plattformsträd och fara ----------------------------------
-  b.rect(12, 17, 16, 17, TileType.Platform);
-  b.rect(20, 15, 24, 15, TileType.Platform);
-  b.rect(28, 18, 29, 20, TileType.Solid); // liten skyddsvalv innan porten
+  // --- Minneslustgården: bred startplattform i varmt ljus -------------------------
+  b.rect(10, 18, 14, 18, TileType.Platform);
 
-  // --- Port: mur med gång --------------------------------------------------------
+  // --- Vandringsplattformen ----------------------------------------------------------
+  b.rect(17, 15, 21, 15, TileType.Platform);
+
+  // --- Zigzaggen upp mot utikten --------------------------------------------------------
+  b.rect(13, 12, 16, 12, TileType.Platform);
+
+  // --- Utsiktsplattformen (rad 9): sista rasten före hoppet ------------------------------
+  b.rect(18, 9, 22, 9, TileType.Platform);
+
+  // --- Skyddsvallen innan porten ------------------------------------------------------------
+  b.rect(27, 18, 28, 20, TileType.Solid);
+
+  // --- Port: mur med gång ---------------------------------------------------------------------
   b.rect(33, 13, 34, 18, TileType.Solid);
   b.rect(35, 4, 35, 18, TileType.Solid);
   b.rect(35, 4, WIDTH - 1, 4, TileType.Solid);
 
-  // --- Spawns ---------------------------------------------------------------------
+  // --- Spawns -------------------------------------------------------------------------------------
   b.spawn({ kind: 'playerSpawn', tx: 3, ty: 20 });
 
   for (const [tx, ty] of [
-    [9, 20],
-    [26, 20],
+    [7, 20],
+    [19, 14],
+    [31, 20],
   ] as const) {
     b.spawn({ kind: 'checkpoint', tx, ty });
   }
@@ -51,31 +61,42 @@ export function buildLevel07(): LevelData {
   b.spawn({ kind: 'exit', tx: 72, ty: 20 });
   b.bossArena('NULL', LEVEL07_ARENA.tx0, LEVEL07_ARENA.ty0, LEVEL07_ARENA.tx1, LEVEL07_ARENA.ty1);
 
-  // Svärmens sista väktare.
+  // Svärmens sista väktare — få, men vaksamma.
   for (const [tx, ty] of [
-    [14, 15],
-    [22, 13],
+    [12, 15],
+    [20, 11],
   ] as const) {
     b.spawn({ kind: 'enemy', enemy: 'Glitcher', tx, ty });
   }
-  b.spawn({ kind: 'enemy', enemy: 'Purger', tx: 30, ty: 16 });
+  for (const [tx, ty] of [
+    [14, 13],
+    [28, 12],
+  ] as const) {
+    b.spawn({ kind: 'enemy', enemy: 'Drone', tx, ty });
+  }
+  b.spawn({ kind: 'enemy', enemy: 'Purger', tx: 24, ty: 9 });
 
-  // Powerups: sköld + extra liv inför slutstriden.
-  b.spawn({ kind: 'powerup', powerup: 'Shield', tx: 31, ty: 20 });
-  b.spawn({ kind: 'powerup', powerup: 'OneUp', tx: 22, ty: 14 });
+  // Powerups: 1-up och trippelhopp på utsikten — gåvor inför det sista hoppet.
+  b.spawn({ kind: 'powerup', powerup: 'OneUp', tx: 20, ty: 8 });
+  b.spawn({ kind: 'powerup', powerup: 'TripleJump', tx: 22, ty: 8 });
+  b.spawn({ kind: 'powerup', powerup: 'Shield', tx: 29, ty: 20 });
 
   // Minnesfragment: Filosofi och Medicin — det dyrbaraste, sist.
   const fragments: Array<[number, number, FragmentTypeName]> = [
-    [6, 20, 'Philosophy'],
-    [10, 20, 'Medicine'],
-    [14, 16, 'Philosophy'],
-    [22, 14, 'Medicine'],
-    [30, 20, 'Philosophy'],
+    [5, 20, 'Philosophy'],
+    [8, 20, 'Medicine'],
+    [12, 17, 'Philosophy'],
+    [19, 14, 'Medicine'],
+    [14, 11, 'Philosophy'],
+    [19, 8, 'Medicine'],
+    [22, 20, 'Philosophy'],
+    [26, 20, 'Medicine'],
+    [31, 19, 'Philosophy'],
     [42, 19, 'Philosophy'],
     [50, 17, 'Medicine'],
     [58, 19, 'Philosophy'],
-    [66, 17, 'Medicine'],
-    [71, 19, 'Philosophy'],
+    [64, 17, 'Medicine'],
+    [70, 19, 'Philosophy'],
   ];
   for (const [tx, ty, fragment] of fragments) {
     b.spawn({ kind: 'fragment', fragment, tx, ty });
@@ -89,7 +110,7 @@ export function buildLevel07(): LevelData {
     intro:
       'ECHO: Utposten framför dig — och bortom den: NULL, frånvaron själv. ' +
       'Ett sista hopp, Mira. Gör det underbart.',
-    parTimeSeconds: 130,
+    parTimeSeconds: 115,
     fragmentTypes: ['Philosophy', 'Medicine'],
   });
 }

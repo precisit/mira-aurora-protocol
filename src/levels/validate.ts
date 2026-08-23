@@ -25,13 +25,17 @@ export function inBounds(data: LevelData, tx: number, ty: number): boolean {
 
 /**
  * A cell is "standable" when it is empty and has solid ground or a one-way
- * platform directly beneath it — where AURORA can stand.
+ * platform directly beneath it — where AURORA can stand. Glitch tiles count
+ * as ground: they flicker on a fixed short cycle, so a patient AURORA can
+ * always wait out the pulse and cross (see LevelData.glitchSolidAt).
  */
 export function isStandableCell(data: LevelData, tx: number, ty: number): boolean {
   if (!inBounds(data, tx, ty)) return false;
   if (tileAt(data, tx, ty) !== TileType.Empty) return false;
   const below = ty + 1 >= data.heightTiles ? TileType.Solid : tileAt(data, tx, ty + 1);
-  return below === TileType.Solid || below === TileType.Platform;
+  return (
+    below === TileType.Solid || below === TileType.Platform || below === TileType.Glitch
+  );
 }
 
 export function validateLevelData(data: LevelData): string[] {
@@ -72,6 +76,8 @@ export function validateLevelData(data: LevelData): string[] {
   for (const spawn of data.spawns) {
     // Boss arenas are tile rects with their own checks below.
     if (spawn.kind === 'boss') continue;
+    // Laser grids are timed rects with their own checks below.
+    if (spawn.kind === 'laser') continue;
     const label = `${spawn.kind}@(${spawn.tx},${spawn.ty})`;
     if (!inBounds(data, spawn.tx, spawn.ty)) {
       issues.push(`${where}: spawn ${label} out of bounds`);
@@ -128,6 +134,45 @@ export function validateLevelData(data: LevelData): string[] {
   if (spawnEntry) {
     for (const cx of checkpointXs) {
       if (cx <= spawnEntry.tx) issues.push(`${where}: checkpoint at x=${cx} not ahead of spawn`);
+    }
+  }
+
+  // --- laser grids (task C2): sane rect + rhythm, never on structural spawns --
+  const lasers = data.spawns.filter(
+    (s): s is Extract<LevelSpawn, { kind: 'laser' }> => s.kind === 'laser',
+  );
+  for (const [i, laser] of lasers.entries()) {
+    const label = `laser grid #${i}`;
+    const rectInBounds =
+      inBounds(data, laser.tx0, laser.ty0) &&
+      inBounds(data, laser.tx1, laser.ty1) &&
+      laser.tx1 >= laser.tx0 &&
+      laser.ty1 >= laser.ty0;
+    if (!rectInBounds) {
+      issues.push(`${where}: ${label} rect out of bounds or inverted`);
+      continue;
+    }
+    if (!(laser.periodMs > 0)) issues.push(`${where}: ${label} needs periodMs > 0`);
+    if (laser.onMs <= 0 || laser.onMs >= laser.periodMs) {
+      issues.push(`${where}: ${label} needs 0 < onMs < periodMs`);
+    }
+    if (!Number.isInteger(laser.offsetMs) || laser.offsetMs < 0) {
+      issues.push(`${where}: ${label} offsetMs must be a non-negative integer`);
+    }
+    for (const structural of data.spawns.filter(
+      (s): s is Extract<LevelSpawn, { kind: 'playerSpawn' | 'checkpoint' | 'exit' }> =>
+        STRUCTURAL_KINDS.has(s.kind),
+    )) {
+      if (
+        structural.tx >= laser.tx0 &&
+        structural.tx <= laser.tx1 &&
+        structural.ty >= laser.ty0 &&
+        structural.ty <= laser.ty1
+      ) {
+        issues.push(
+          `${where}: ${label} covers ${structural.kind}@(${structural.tx},${structural.ty}) — unfair`,
+        );
+      }
     }
   }
 

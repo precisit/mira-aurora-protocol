@@ -27,31 +27,40 @@ function spawnsOfKind<K extends LevelSpawn['kind']>(
 }
 
 describe('A1: campaign registry', () => {
-  it('ships the first three of seven planned levels', () => {
-    expect(CAMPAIGN_LEVELS).toHaveLength(3);
+  it('ships the complete seven-level campaign (task C2)', () => {
+    expect(CAMPAIGN_LEVELS).toHaveLength(7);
     expect(LEVEL_COUNT).toBe(7);
-    expect(CAMPAIGN_LEVELS.map((l) => l.index)).toEqual([1, 2, 3]);
+    expect(CAMPAIGN_LEVELS.map((l) => l.index)).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
-  it('matches the PLAN.md level table for 1–3', () => {
-    const [l1, l2, l3] = CAMPAIGN_LEVELS;
-    expect(l1?.name).toBe('Mnemosynes fall');
-    expect(l1?.theme).toBe('Rymdstationsruin');
-    expect(l2?.name).toBe('Datastormen');
-    expect(l2?.theme).toBe('Korrupt datastorm');
-    expect(l3?.name).toBe('XENO-tunneln');
-    expect(l3?.theme).toBe('Svärmens tunnel');
+  it('matches the PLAN.md level table', () => {
+    const names = CAMPAIGN_LEVELS.map((l) => l.name);
+    expect(names).toEqual([
+      'Mnemosynes fall',
+      'Datastormen',
+      'XENO-tunneln',
+      'Kolonin Tystnad',
+      'VESSEL:s valv',
+      'Glitchskeppet',
+      'Utpost Aurora',
+    ]);
+    expect(CAMPAIGN_LEVELS[3]?.theme).toBe('Övergiven koloni');
+    expect(CAMPAIGN_LEVELS[4]?.theme).toBe('Låst valv');
+    expect(CAMPAIGN_LEVELS[5]?.theme).toBe('Spegelbild av nivå 1, korrupt');
+    expect(CAMPAIGN_LEVELS[6]?.theme).toBe('Finalen');
   });
 
   it('resolves levels by index and rejects unknown ones', () => {
     expect(getLevel(2)?.id).toBe('lvl-02-datastormen');
-    expect(() => getLevel(4)).toThrow(/no level with index 4/);
+    expect(getLevel(4)?.id).toBe('lvl-04-kolonin-tystnad');
+    expect(getLevel(7)?.id).toBe('lvl-07-outpost-aurora');
     expect(() => getLevel(0)).toThrow();
+    expect(() => getLevel(8)).toThrow(/no level with index 8/); // ghost lives outside the campaign
   });
 
   it('gives every level unique ids and non-empty ECHO intros', () => {
     const ids = new Set(CAMPAIGN_LEVELS.map((l) => l.id));
-    expect(ids.size).toBe(3);
+    expect(ids.size).toBe(7);
     for (const level of CAMPAIGN_LEVELS) {
       expect(level.intro.length).toBeGreaterThan(10);
       expect(level.intro).toContain('ECHO:');
@@ -104,7 +113,7 @@ describe('A2: all levels parse and pass static validation', () => {
 
     it(`"${data.name}" keeps every spawn inside bounds on a free tile`, () => {
       for (const s of data.spawns) {
-        if (s.kind === 'boss') continue; // tile-rect arena, checked in bosses tests
+        if (s.kind === 'boss' || s.kind === 'laser') continue; // tile rects, checked separately
         expect(s.tx).toBeGreaterThanOrEqual(0);
         expect(s.tx).toBeLessThan(data.widthTiles);
         expect(s.ty).toBeGreaterThanOrEqual(0);
@@ -187,10 +196,10 @@ describe('A3: reachability', () => {
     expect(isReachable(data, DOUBLE_JUMP_PROFILE, exit.tx, exit.ty)).toBe(true);
   });
 
-  it('levels 2 and 3 are completable with the double jump', () => {
-    for (const data of [CAMPAIGN_LEVELS[1]!, CAMPAIGN_LEVELS[2]!]) {
+  it('levels 2–7 are completable with the double jump', () => {
+    for (const data of CAMPAIGN_LEVELS.slice(1)) {
       const exit = spawnsOfKind(data, 'exit')[0]!;
-      expect(isReachable(data, DOUBLE_JUMP_PROFILE, exit.tx, exit.ty)).toBe(true);
+      expect(isReachable(data, DOUBLE_JUMP_PROFILE, exit.tx, exit.ty), data.name).toBe(true);
     }
   });
 });
