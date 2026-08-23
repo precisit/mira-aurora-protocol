@@ -16,6 +16,8 @@ export interface HudState {
   totalTimeText: string | null;
   /** Transient message (menu hints, pause text); null hides it. */
   message: string | null;
+  /** B1 "juice" telemetry line (particles/shake/bloom); null hides it. */
+  juiceLine?: string | null;
 }
 
 export interface Hud {
@@ -60,6 +62,7 @@ export class DomHud implements Hud {
     if (state.totalTimeText !== null) parts.push(`total: ${state.totalTimeText}`);
     let html = `<span class="hud-title">${parts[0]}</span><span>${parts.slice(1).join(' · ')}</span>`;
     if (state.message) html += `<span class="hud-message">${escapeHtml(state.message)}</span>`;
+    if (state.juiceLine) html += `<span class="hud-juice">${escapeHtml(state.juiceLine)}</span>`;
     this.root.innerHTML = html;
   }
 
