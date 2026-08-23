@@ -81,6 +81,30 @@ export class LevelBuilder {
   }
 
   /**
+   * Lay a timed laser grid (task C2): an inclusive tile rect that pulses on
+   * `periodMs` (beam fires for `onMs`, shifted by `offsetMs`). Keep the span
+   * clear of solid tiles so the beam reads and hits cleanly.
+   */
+  public laserGrid(
+    tx0: number,
+    ty0: number,
+    tx1: number,
+    ty1: number,
+    timing: { periodMs: number; onMs: number; offsetMs?: number },
+  ): this {
+    return this.spawn({
+      kind: 'laser',
+      tx0,
+      ty0,
+      tx1,
+      ty1,
+      periodMs: timing.periodMs,
+      onMs: timing.onMs,
+      offsetMs: timing.offsetMs ?? 0,
+    });
+  }
+
+  /**
    * Finish the level. `meta` must be complete for campaign levels — use
    * {@link validateLevelData} (tests + CI) to catch authoring mistakes.
    */

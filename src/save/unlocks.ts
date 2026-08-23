@@ -74,3 +74,23 @@ export function syncWeaponUnlocks(data: SaveData): boolean {
   }
   return changed;
 }
+
+// --------------------------------------------------------- ghost level --
+// Bonusbanan ("Spökfrekvensen", task C2) låses upp av ackumulerad poäng —
+// PLAN.md §4: "en spökbana låses upp om totalpoängen passerar 150 000".
+
+/** Total score required before the ghost level appears. */
+export const GHOST_LEVEL_UNLOCK_SCORE = 150_000;
+
+/** True once the lifetime total score has earned the hidden ghost level. */
+export function isGhostLevelUnlocked(totalScore: number): boolean {
+  return totalScore >= GHOST_LEVEL_UNLOCK_SCORE;
+}
+
+/**
+ * True when the ghost level was freshly earned between two total-score
+ * readings (same monotonic contract as {@link newlyUnlockedWeapons}).
+ */
+export function newlyUnlockedGhostLevel(beforeTotal: number, afterTotal: number): boolean {
+  return !isGhostLevelUnlocked(beforeTotal) && isGhostLevelUnlocked(afterTotal);
+}

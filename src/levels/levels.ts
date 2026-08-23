@@ -2,38 +2,50 @@ import type { LevelData } from './LevelData';
 import { buildLevel01 } from './Level01MnemosynesFall';
 import { buildLevel02 } from './Level02Datastormen';
 import { buildLevel03 } from './Level03XenoTunneln';
+import { buildLevel04 } from './Level04KoloninTystnad';
 import { buildLevel05 } from './Level05VesselsValv';
+import { buildLevel06 } from './Level06Glitchskeppet';
 import { buildLevel07 } from './Level07OutpostAurora';
+import { buildGhostLevel } from './Level08Spokfrekvensen';
+import { isGhostLevelUnlocked } from '../save/unlocks';
 
 /**
- * Campaign registry (task A2). Levels are pure data modules; wave A2 ships
- * levels 1–3 per the PLAN.md §4 level table. Later waves append 4–7.
+ * Campaign registry (task C2 — the complete campaign per PLAN.md §4):
  *
- * Task B2 note — boss rooms: CAMPAIGN_LEVELS still holds the authored
- * campaign only. The two boss arenas below are minimal playable stand-ins
- * for slots 5 (VESSEL) and 7 (NULL) so the fights are browser-testable now.
- * When wave Fas 3 authors the real levels, each simply embeds a
- * `{ kind: 'boss', boss: 'VESSEL' | 'NULL', tx0…ty1 }` spawn (see
- * LevelBuilder.bossArena) anywhere along its route and deletes the matching
- * stand-in here — no gameplay code changes are needed: GameSession arms the
+ *   1 Mnemosynes fall · 2 Datastormen · 3 XENO-tunneln · 4 Kolonin Tystnad
+ *   5 VESSEL:s valv (boss: VESSEL) · 6 Glitchskeppet · 7 Utpost Aurora (boss: NULL)
+ *
+ * Levels are pure data modules. Slots 5 and 7 embed their `{ kind: 'boss' }`
+ * arena spawns directly (see LevelBuilder.bossArena): GameSession arms the
  * encounter when AURORA enters the rect, locks the camera, shows the HP bar
  * and seals the exit until the boss falls.
+ *
+ * The ghost level ("Spökfrekvensen", slot 8) lives outside the campaign flow
+ * so the win screen still lands after level 7; it joins the playable list
+ * only once total score passes GHOST_LEVEL_UNLOCK_SCORE (see
+ * {@link playableLevelsForTotalScore}).
  */
 
 export const CAMPAIGN_LEVELS: readonly LevelData[] = [
   buildLevel01(),
   buildLevel02(),
   buildLevel03(),
+  buildLevel04(),
+  buildLevel05(),
+  buildLevel06(),
+  buildLevel07(),
 ];
 
-/** Minimal boss-fight stand-ins for PLAN.md slots 5 and 7 (see note above). */
-export const ARENA_TEST_LEVELS: readonly LevelData[] = [buildLevel05(), buildLevel07()];
+/** Hidden bonus level (slot 8) — gated behind the 150k lifetime total. */
+export const GHOST_LEVEL: LevelData = buildGhostLevel();
 
-/**
- * Every playable level, indexed by campaign slot: authored campaign first,
- * then the boss-arena stand-ins for the unbuilt slots.
- */
-export const PLAYABLE_LEVELS: readonly LevelData[] = [...CAMPAIGN_LEVELS, ...ARENA_TEST_LEVELS];
+/** Every campaign level plus the ghost level when `totalScore` earned it. */
+export function playableLevelsForTotalScore(totalScore: number): readonly LevelData[] {
+  return isGhostLevelUnlocked(totalScore) ? [...CAMPAIGN_LEVELS, GHOST_LEVEL] : CAMPAIGN_LEVELS;
+}
+
+/** The linear campaign flow (1→7); main.ts progression walks exactly this. */
+export const PLAYABLE_LEVELS: readonly LevelData[] = CAMPAIGN_LEVELS;
 
 export const LEVEL_COUNT = 7;
 
@@ -44,9 +56,4 @@ export function getLevel(index: number): LevelData {
     throw new Error(`getLevel: no level with index ${index} (built: ${CAMPAIGN_LEVELS.length}/${LEVEL_COUNT})`);
   }
   return level;
-}
-
-/** Look up any playable level (campaign or boss arena) by campaign slot. */
-export function getPlayableLevel(index: number): LevelData | undefined {
-  return PLAYABLE_LEVELS.find((l) => l.index === index);
 }

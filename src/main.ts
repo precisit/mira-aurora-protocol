@@ -16,6 +16,7 @@ import {
 import { copyRgba, setRgba, SpriteDrawPool } from './renderer/SpriteDrawPool';
 import { DomHud } from './ui/Hud';
 import { IntroSequence } from './ui/IntroSequence';
+import { DomMenu, type MenuCommand } from './ui/Menu';
 import { SaveStore } from './save/SaveStore';
 import { newlyUnlockedWeapons } from './save/unlocks';
 import { WEAPONS } from './game/weapons';
@@ -59,6 +60,22 @@ const TINT_SOLID_B: Rgba = [0.1, 0.62, 0.95, 1];
 const TINT_PLATFORM: Rgba = [1.0, 0.35, 0.85, 1];
 const TINT_HAZARD: Rgba = [1.0, 0.45, 0.15, 1];
 const GLOW_HAZARD: Rgba = [1.0, 0.45, 0.15, 1.4];
+// Glitch tiles (task C2): hot violet-white while solid, a faint residue when
+// the corruption pulse leaves them "empty".
+const TINT_GLITCH_SOLID: Rgba = [0.75, 0.4, 1.0, 1];
+const TINT_GLITCH_EMPTY: Rgba = [0.55, 0.3, 0.9, 0.14];
+// C3: the animated residue scanline reuses one shared tuple (alpha 0.35 over
+// the solid hue) instead of allocating a fresh tint per tile per frame.
+const GLITCH_RESIDUE_TINT: Rgba = [
+  TINT_GLITCH_SOLID[0],
+  TINT_GLITCH_SOLID[1],
+  TINT_GLITCH_SOLID[2],
+  0.35,
+];
+const GLOW_GLITCH: Rgba = [0.75, 0.45, 1.0, 1.6];
+// Level laser grids (task C2) share the boss beam family but read colder.
+const GRID_LASER_COLOR: Rgba = [1, 0.28, 0.42, 1];
+const GRID_LASER_CORE: Rgba = [1, 0.93, 0.97, 1];
 
 const PLAYER_COLOR: Rgba = [0.45, 0.95, 1, 1];
 const PLAYER_CORE_COLOR: Rgba = [1, 1, 1, 1];
@@ -148,12 +165,21 @@ async function boot(): Promise<void> {
   });
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
   const hudRoot = document.getElementById('hud-root');
+  const menuHost = document.getElementById('menu-root');
   const state = new GameStateMachine();
   // Task B5: level + total run clocks, kept in sync with the state machine
   // (MENU→PLAYING starts the run, PAUSED pauses, GAMEOVER restarts the level
   // clock while total keeps accumulating — speedrun rules per PLAN.md §4).
   const timer = new LevelTimer();
   const detachTimerSync = attachLevelTimer(state, timer);
+
+  // ---- C1 meta layer: menus -------------------------------------------------
+  // The DomMenu owns screens inside MENU/PAUSED (main list, weapon shop,
+  // highscores, Archive, settings); commands come back here for execution.
+  const menu = new DomMenu(menuHost ?? document.body, {
+    onCommand: handleMenuCommand,
+    hints: ['\u2191/\u2193 SELECT', 'ENTER CONFIRM', 'ESC BACK'],
+  });
 
   // ---- B4 intro (skippable, once per page session) ------------------------
   let intro: IntroSequence | null = null;
@@ -203,6 +229,8 @@ async function boot(): Promise<void> {
   let levelFinished = false;
   /** Highest total score (banked + in-run) we've already granted unlocks for. */
   let unlockWatermark = saveData.totalScore;
+  /** Timestamp of the last drawn frame — drives the FPS lock (C1 settings). */
+  let lastRenderAtMs = 0;
 
   const sfxSink = (name: SfxName, options?: { step?: number }): void => {
     audio.playSfx(name, options);
@@ -336,6 +364,61 @@ async function boot(): Promise<void> {
     return PLAYABLE_LEVELS.find((l) => l.index === index);
   }
 
+  // ---- C1 menu command execution --------------------------------------------
+  // The menu layer proposes; the host disposes: state transitions stay here so
+  // the meta layer never touches the simulation directly.
+  function handleMenuCommand(command: MenuCommand): void {
+    switch (command.kind) {
+      case 'nav': {
+        switch (command.action) {
+          case 'start-game':
+            levelIndex = 1;
+            carriedDoubleJump = false;
+            startLevel(levelIndex);
+            state.transition(GameStateName.Playing);
+            audio.playSfx('checkpoint');
+            break;
+          case 'resume':
+            state.transition(GameStateName.Playing);
+            audio.resumeMusic();
+            break;
+          case 'restart-level':
+            startLevel(levelIndex); // fresh attempt, 3 lives, score zeroed
+            state.transition(GameStateName.Playing);
+            audio.playSfx('checkpoint');
+            break;
+          case 'quit-to-menu':
+            levelFinished = false;
+            session = null; // drop the frozen run; parallax stays as backdrop
+            audio.stopMusic();
+            state.transition(GameStateName.Menu);
+            break;
+          default:
+            // Sub-screen navigation (opens/back) — audible confirmation only.
+            audio.playSfx('ui-click');
+            break;
+        }
+        break;
+      }
+      case 'setting-volume': {
+        const current = saveData.settings[command.channel];
+        const stepped = Math.round((current + command.delta) * 10) / 10;
+        saveData.settings[command.channel] = Math.min(1, Math.max(0, stepped));
+        audio.applySettings(saveData.settings);
+        save.save(audio.captureVolumesInto(saveData));
+        break;
+      }
+      case 'toggle-fps-cap':
+        // Battery saver toggle (PLAN.md §6): uncapped ⇄ 60 FPS rendering.
+        // One persisted field drives BOTH render-skip paths: the C3 loop's
+        // drift-corrected present lock and the per-render guard below.
+        saveData.settings.fpsCap = saveData.settings.fpsCap === null ? 60 : null;
+        save.save(audio.captureVolumesInto(saveData));
+        loop.setFpsCap(sanitizeFpsCap(saveData.settings.fpsCap));
+        break;
+    }
+  }
+
   // ---- B1 continuous juice observers ---------------------------------------
   // Player state from the previous fixed step, used to detect jump/land
   // edges and newly fired projectiles (the session exposes no dedicated
@@ -373,6 +456,8 @@ async function boot(): Promise<void> {
 
   // Per-frame input latches: fixed-step updates may run 0..N times per frame,
   // so edge-triggered actions are captured once and explicitly consumed.
+  // Refreshed at the top of every update step (not per render) so presses are
+  // never dropped when the FPS lock skips render frames (C1 settings).
   const latches: FrameLatches = { jump: false, pause: false, confirm: false, swap: false };
 
   // C3: DOM HUD refresh throttle (~10 Hz).
@@ -488,6 +573,8 @@ async function boot(): Promise<void> {
     },
 
     update(stepMs) {
+      refreshLatches();
+
       // Intro owns BOOT: advance it, and swallow the frame that ends it so a
       // skip keypress never leaks into the menu's "press SPACE to start".
       if (intro && state.current === GameStateName.Boot) {
@@ -504,21 +591,34 @@ async function boot(): Promise<void> {
       // ---- state machine (edge-latched so multi-step frames can't toggle) --
       switch (state.current) {
         case GameStateName.Menu:
+        case GameStateName.Paused: {
+          // C1: the menu layer owns input in both states (main list and pause
+          // overlay share navigation; PAUSED's root treats Esc/P as resume).
+          // Menu actions read edge-triggered presses directly — they are
+          // consumed within this same step (endFrame clears them below).
+          if (input.wasPressed(InputAction.MenuUp)) menu.model.move(-1);
+          if (input.wasPressed(InputAction.MenuDown)) menu.model.move(1);
+          const leftPressed = input.wasPressed(InputAction.Left);
+          const rightPressed = input.wasPressed(InputAction.Right);
+          if (leftPressed || rightPressed) {
+            menu.dispatch(menu.model.adjustSelected(leftPressed ? -1 : 1));
+          }
+          const backRequested = input.wasPressed(InputAction.MenuBack);
+          const pauseRequested = takeLatch('pause');
+          if (backRequested || pauseRequested) {
+            // Esc/P/Backspace: pop a sub-screen if one is open; at a root
+            // screen it leaves the menu layer (MENU stays, PAUSED resumes).
+            if (!menu.handleBack() && state.current === GameStateName.Paused) {
+              state.transition(GameStateName.Playing);
+              audio.resumeMusic();
+            }
+            break;
+          }
           if (takeLatch('confirm') || takeLatch('jump')) {
-            levelIndex = 1;
-            carriedDoubleJump = false;
-            startLevel(levelIndex);
-            state.transition(GameStateName.Playing);
-            audio.playSfx('checkpoint');
+            menu.dispatch(menu.model.activate());
           }
           break;
-
-        case GameStateName.Paused:
-          if (takeLatch('pause') || takeLatch('confirm')) {
-            state.transition(GameStateName.Playing);
-            audio.resumeMusic();
-          }
-          break;
+        }
 
         case GameStateName.GameOver:
           if (takeLatch('confirm') || takeLatch('jump')) {
@@ -529,6 +629,8 @@ async function boot(): Promise<void> {
 
         case GameStateName.Win:
           if (takeLatch('confirm') || takeLatch('jump')) {
+            session = null;
+            levelFinished = false;
             state.transition(GameStateName.Menu);
           }
           break;
@@ -575,9 +677,19 @@ async function boot(): Promise<void> {
 
       input.endFrame();
     },
-
     render(_alpha, frameDeltaMs) {
-      refreshLatches();
+      // C1 FPS lock (settings): when capped, skip drawing whole frames — the
+      // canvas keeps the last image while the 120 Hz simulation above keeps
+      // running. Latches are refreshed per update step (not per render), so
+      // skipped frames never drop input; the same persisted field also drives
+      // the loop's own drift-corrected present lock (C3).
+      const fpsCap = saveData.settings.fpsCap;
+      if (fpsCap !== null && fpsCap > 0) {
+        const now = performance.now();
+        const minFrameMs = 1000 / fpsCap - 1.5; // small slack for rAF jitter
+        if (now - lastRenderAtMs < minFrameMs) return;
+        lastRenderAtMs = now;
+      }
 
       // B4 intro owns BOOT: draw the cinematic over black and keep the HUD
       // hidden until the menu/gameplay UI takes over.
@@ -586,8 +698,19 @@ async function boot(): Promise<void> {
         renderer.beginFrame([0, 0, 0, 1]);
         (intro as IntroSequence).render();
         renderer.endFrame();
+        menu.hide();
         if (hudRoot) hudRoot.style.display = 'none';
         return;
+      }
+
+      // C1 meta layer visibility: main menu over MENU, pause overlay during
+      // PAUSED, nothing during gameplay/win/game-over.
+      if (state.current === GameStateName.Menu || state.current === GameStateName.Paused) {
+        menu.setMode(state.current === GameStateName.Menu ? 'main' : 'pause');
+        menu.show();
+        menu.sync(saveData);
+      } else {
+        menu.hide();
       }
 
       // B1 screen shake rides the camera transform: everything world-space
@@ -602,9 +725,11 @@ async function boot(): Promise<void> {
 
       if (session) {
         renderer.drawSprites('white', buildWorldSprites(renderer, session, panX, offsetY));
-        // Gameplay particles reuse their pooled draw list (C3); drawn before
-        // boss overlays so beams/voids stay on top, matching previous order.
+        // Gameplay particles reuse their pooled draw list (C3); drawn after
+        // world sprites and before the boss overlays so beams/voids stay on
+        // top, matching previous order on both branches.
         renderer.drawSprites('white', session.particles.buildDraws());
+        drawLevelLaserGrids(renderer, session, panX, offsetY);
         drawBossOverlays(renderer, session, panX, offsetY);
         renderer.drawSprites('white', juice.particles.buildDraws());
         drawDarkness(renderer, session);
@@ -653,9 +778,9 @@ async function boot(): Promise<void> {
 
     switch (state.current) {
       case GameStateName.Menu:
-        return 'PRESS SPACE TO START · ARROWS/AD MOVE · SPACE JUMP · J SHOOT · P PAUSE';
       case GameStateName.Paused:
-        return 'PAUSED — P OR ENTER TO RESUME';
+        // C1: menus carry their own hints; the HUD message line stays quiet.
+        return null;
       case GameStateName.GameOver:
         return 'GAME OVER — ENTER TO RETRY THIS LEVEL';
       case GameStateName.Win:
@@ -673,6 +798,7 @@ async function boot(): Promise<void> {
     detachAudioUnlock();
     detachTimerSync();
     intro?.dispose();
+    menu.destroy();
     audio.dispose();
     hud.destroy();
   });
@@ -746,6 +872,31 @@ function buildWorldSprites(
             hazard.height = TILE_SIZE - 12;
             copyRgba(hazard.tint, TINT_HAZARD);
             hazard.glow = GLOW_HAZARD;
+            break;
+          }
+          case TileType.Glitch: {
+            // Corruption pulse: solid tiles burn violet; empty ones leave a
+            // faint residue so the bridge can be read in advance. (C2 visual,
+            // C3 pooled records — no per-frame allocations.)
+            const glitchSolid = level.glitchTilesSolid;
+            const glitchQuad = pool.next();
+            glitchQuad.x = x;
+            glitchQuad.y = y + (glitchSolid ? 0 : 10);
+            glitchQuad.width = TILE_SIZE;
+            glitchQuad.height = glitchSolid ? TILE_SIZE : 8;
+            copyRgba(glitchQuad.tint, glitchSolid ? TINT_GLITCH_SOLID : TINT_GLITCH_EMPTY);
+            if (glitchSolid) {
+              glitchQuad.glow = GLOW_GLITCH;
+              glitchQuad.blend = 'additive';
+            } else {
+              const residue = pool.next();
+              residue.x = x + 4;
+              residue.y = y + 12 + (Math.floor(session.timeMs / 90) % 6);
+              residue.width = TILE_SIZE - 8;
+              residue.height = 2;
+              copyRgba(residue.tint, GLITCH_RESIDUE_TINT);
+              residue.blend = 'additive';
+            }
             break;
           }
         }
@@ -945,6 +1096,73 @@ const LASER_CORE_GLOW: Rgba = [1, 1, 1, 2];
 const beamPool = new SpriteDrawPool(64);
 const voidPool = new SpriteDrawPool(64);
 const overlayQuadPool = new SpriteDrawPool(4);
+
+// C2 level laser grids share the pooled treatment (C3): static glow tuples,
+// reusable records, one stable draw array.
+const gridLaserPool = new SpriteDrawPool(128);
+const GRID_LASER_TELEGRAPH_GLOW: Rgba = [
+  GRID_LASER_COLOR[0],
+  GRID_LASER_COLOR[1],
+  GRID_LASER_COLOR[2],
+  1.5,
+];
+const GRID_LASER_BAND_GLOW: Rgba = [
+  GRID_LASER_COLOR[0],
+  GRID_LASER_COLOR[1],
+  GRID_LASER_COLOR[2],
+  2.4,
+];
+const GRID_LASER_CORE_GLOW: Rgba = [1, 1, 1, 2];
+
+/**
+ * Level laser grids (task C2): blinking telegraph lines, then a glowing
+ * beam with a white-hot core while the pulse fires.
+ */
+function drawLevelLaserGrids(
+  renderer: WebGPURenderer,
+  session: GameSession,
+  panX: number,
+  offsetY: number,
+): void {
+  const camY = session.cameraY + offsetY;
+  const draws = gridLaserPool;
+  draws.reset();
+
+  for (const line of session.telegraphLaserBoxes()) {
+    const blink = 0.35 + 0.45 * Math.abs(Math.sin(session.timeMs / 80));
+    const quad = draws.next();
+    quad.x = line.x - panX;
+    quad.y = line.y - camY;
+    quad.width = line.width;
+    quad.height = line.height;
+    setRgba(quad.tint, GRID_LASER_COLOR[0], GRID_LASER_COLOR[1], GRID_LASER_COLOR[2], blink);
+    quad.glow = GRID_LASER_TELEGRAPH_GLOW;
+    quad.blend = 'additive';
+  }
+
+  for (const box of session.firingLaserBoxes()) {
+    // Outer glow band + white-hot core line.
+    const band = draws.next();
+    band.x = box.x - 6 - panX;
+    band.y = box.y - 6 - camY;
+    band.width = box.width + 12;
+    band.height = box.height + 12;
+    setRgba(band.tint, GRID_LASER_COLOR[0], GRID_LASER_COLOR[1], GRID_LASER_COLOR[2], 0.55);
+    band.glow = GRID_LASER_BAND_GLOW;
+    band.blend = 'additive';
+
+    const core = draws.next();
+    core.x = box.x - panX;
+    core.y = box.y - camY;
+    core.width = box.width;
+    core.height = box.height;
+    copyRgba(core.tint, GRID_LASER_CORE);
+    core.glow = GRID_LASER_CORE_GLOW;
+    core.blend = 'additive';
+  }
+
+  if (draws.length > 0) renderer.drawSprites('white', draws.view());
+}
 
 function drawBossOverlays(
   renderer: WebGPURenderer,

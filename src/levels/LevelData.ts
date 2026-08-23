@@ -28,6 +28,30 @@ export enum TileType {
   Platform = 2,
   /** Instant-death hazard (energy field / pit floor). */
   Hazard = 3,
+  /**
+   * Corrupt platform (level 6, task C2): flickers between solid and empty on
+   * the fixed {@link GLITCH_CYCLE_MS} cycle (see {@link glitchSolidAt}).
+   * Static analysis treats it as ground — a patient AURORA can always cross
+   * by waiting out the pulse.
+   */
+  Glitch = 4,
+}
+
+// ------------------------------------------------------------ glitch tiles --
+
+/** Length of one full solid↔empty corruption pulse, in ms. */
+export const GLITCH_CYCLE_MS = 1900;
+/** How long of each cycle a glitch tile holds solidity, in ms. */
+export const GLITCH_SOLID_MS = 1050;
+
+/**
+ * Pure glitch-phase math shared by physics, validation and rendering:
+ * true while glitch tiles are solid at `timeMs`. Deterministic so level
+ * tests can step straight into either phase.
+ */
+export function glitchSolidAt(timeMs: number): boolean {
+  const t = Math.max(0, timeMs) % GLITCH_CYCLE_MS;
+  return t < GLITCH_SOLID_MS;
 }
 
 // ------------------------------------------------------------- spawn layer --
@@ -50,7 +74,23 @@ export type LevelSpawn =
    * the encounter when AURORA steps inside — the boss spawns, the camera
    * locks to these bounds and the exit stays sealed until the boss falls.
    */
-  | { kind: 'boss'; boss: BossId; tx0: number; ty0: number; tx1: number; ty1: number };
+  | { kind: 'boss'; boss: BossId; tx0: number; ty0: number; tx1: number; ty1: number }
+  /**
+   * Timed laser grid (task C2, level 4): an inclusive tile rect that pulses
+   * on a fixed rhythm — off (with a telegraph before firing), then a damaging
+   * beam for `onMs` every `periodMs`, shifted by `offsetMs`. Damage + visual
+   * support lives in src/game/lasers.ts and GameSession.
+   */
+  | {
+      kind: 'laser';
+      tx0: number;
+      ty0: number;
+      tx1: number;
+      ty1: number;
+      periodMs: number;
+      onMs: number;
+      offsetMs: number;
+    };
 
 // ---------------------------------------------------------------- metadata --
 
@@ -81,7 +121,7 @@ export interface LevelData {
 // Hand-authored levels can also be written as ASCII rows (Tiled-export
 // friendly): one character per tile.
 //
-//   Tiles     '.' empty · '#' solid · '=' platform · '^' hazard
+//   Tiles     '.' empty · '#' solid · '=' platform · '^' hazard · '%' glitch
 //   Structure 'S' player spawn · 'C' checkpoint · 'G' exit
 //   Unlock    'J' double-jump unlock (permanent, story pickup)
 //   Powerups  'O' Overcharge · 'V' Shield · 'M' Magnet · 'T' TripleJump · 'U' 1Up
@@ -94,6 +134,7 @@ export const ASCII_TILES: Readonly<Record<string, TileType>> = {
   '#': TileType.Solid,
   '=': TileType.Platform,
   '^': TileType.Hazard,
+  '%': TileType.Glitch,
 };
 
 /** ASCII char → spawn factory, shared by the parser and tooling. */
