@@ -32,8 +32,11 @@ const TINT_SOLID_A: Rgba = [0.16, 0.9, 1.0, 1];
 const TINT_SOLID_B: Rgba = [0.1, 0.62, 0.95, 1];
 const TINT_PLATFORM: Rgba = [1.0, 0.35, 0.85, 1];
 const TINT_HAZARD: Rgba = [1.0, 0.45, 0.15, 1];
-const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.8];
-const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.9];
+const GLOW_HAZARD: Rgba = [1.0, 0.45, 0.15, 1.4];
+const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.9];
+const GLOW_MARKER_CHECKPOINT: Rgba = [1.0, 0.92, 0.35, 2.2];
+const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.95];
+const GLOW_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 2.6];
 
 interface DemoState {
   cameraX: number;
@@ -112,23 +115,33 @@ async function boot(): Promise<void> {
             sprites.push({ x, y, width: TILE_SIZE, height: 10, tint: TINT_PLATFORM });
             break;
           case TileType.Hazard:
-            sprites.push({ x, y: y + 6, width: TILE_SIZE, height: TILE_SIZE - 12, tint: TINT_HAZARD });
+            sprites.push({
+              x,
+              y: y + 6,
+              width: TILE_SIZE,
+              height: TILE_SIZE - 12,
+              tint: TINT_HAZARD,
+              glow: GLOW_HAZARD,
+            });
             break;
         }
       }
     }
 
-    // Checkpoints & goal as glowing markers so the data is visible in-demo.
+    // Checkpoints & goal as additive glowing markers so the data is visible
+    // in-demo (exercises the neon-glow sprite path from the A1 wave).
     for (const marker of level.data.markers) {
       if (marker.kind === 'spawn') continue;
-      const tint = marker.kind === 'checkpoint' ? TINT_MARKER_CHECKPOINT : TINT_MARKER_GOAL;
+      const isCheckpoint = marker.kind === 'checkpoint';
       const height = TILE_SIZE * 2;
       sprites.push({
         x: Level.tileToWorldX(marker.tx) + 10 - demo.cameraX,
         y: Level.tileToWorldY(marker.ty + 1) - height,
         width: 12,
         height,
-        tint,
+        tint: isCheckpoint ? TINT_MARKER_CHECKPOINT : TINT_MARKER_GOAL,
+        glow: isCheckpoint ? GLOW_MARKER_CHECKPOINT : GLOW_MARKER_GOAL,
+        blend: 'additive',
       });
     }
 

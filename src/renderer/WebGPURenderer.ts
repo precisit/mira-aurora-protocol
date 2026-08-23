@@ -1,40 +1,41 @@
+import { BloomPass, type BloomParams } from './BloomPass';
 import { SPRITE_SHADER_WGSL } from './shaders';
+import {
+  INSTANCE_STRIDE_BYTES,
+  SpriteBatch,
+  groupQuads,
+  type TaggedQuad,
+} from './SpriteBatch';
+import {
+  MAX_DEVICE_PIXEL_RATIO,
+  VIRTUAL_HEIGHT,
+  VIRTUAL_WIDTH,
+  type Rgba,
+  type SpriteDraw,
+  type ViewBounds,
+} from './types';
 
 /**
- * Fixed virtual resolution (PLAN.md §6 "Skärm & letterbox"):
- * the gameplay area is always 1280×720. The view is scaled so that the
- * *height* always fills the screen; wider screens (iPhone landscape ≈ 19.5:9)
- * get extended background in the side gutters while the gameplay area stays
- * pixel-identical across devices.
+ * WebGPU renderer (A1 wave).
+ *
+ * Frame flow — everything is instanced and batched (PLAN.md §6):
+ *   1. `beginFrame` starts a render pass into an offscreen scene texture.
+ *   2. `drawSprites` queues quads; at `endFrame` they are packed once and
+ *      drawn as one instanced draw call per (texture × blend-mode) group.
+ *   3. The bloom post-pass (bright → separable blur → composite) presents
+ *      the scene to the canvas; if bloom setup failed it degrades to a
+ *      plain copy so rendering never dies because of post-processing.
+ *
+ * Letterbox: the view always fills the window's height around the fixed
+ * 1280×720 gameplay area; wider screens get parallax-only side gutters.
  */
-export const VIRTUAL_WIDTH = 1280;
-export const VIRTUAL_HEIGHT = 720;
 
-/** Battery-friendly devicePixelRatio cap (PLAN.md §6). */
-export const MAX_DEVICE_PIXEL_RATIO = 2;
+export { MAX_DEVICE_PIXEL_RATIO, VIRTUAL_HEIGHT, VIRTUAL_WIDTH } from './types';
+export type { Rgba, SpriteBlendMode, SpriteDraw, ViewBounds } from './types';
 
-export type Rgba = readonly [number, number, number, number];
-
-export interface SpriteDraw {
-  /** Top-left corner in virtual pixels. May extend into side gutters. */
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  /** Texture-space rect; defaults to the full texture. */
-  u0?: number;
-  v0?: number;
-  u1?: number;
-  v1?: number;
-  tint?: Rgba;
-}
-
-/** Visible virtual-space bounds of the current frame, including gutters. */
-export interface ViewBounds {
-  left: number;
-  right: number;
-  top: number;
-  bottom: number;
+export interface BloomState {
+  readonly available: boolean;
+  readonly params: Readonly<BloomParams>;
 }
 
 /** Thrown for any renderer setup failure — message is user-displayable. */
@@ -47,29 +48,24 @@ export class WebGPURendererError extends Error {
 
 /**
  * WebGPU usage flags (spec-stable numeric values).
- * TypeScript's DOM lib types the `usage` fields as `GPUBufferUsageFlags` /
- * `GPUTextureUsageFlags` but does not expose the runtime constant objects
- * (`GPUBufferUsage` etc. live in @webgpu/types), so we declare the values here.
+ * TypeScript's DOM lib types the `usage` fields but does not expose the
+ * runtime constant objects (`GPUBufferUsage` etc.), so we declare them here.
  * Source: https://gpuweb.github.io/gpuweb/#buffer-usage
  */
 const BUFFER_USAGE = {
-  MAP_READ: 0x0001,
-  MAP_WRITE: 0x0002,
-  COPY_SRC: 0x0004,
   COPY_DST: 0x0008,
-  INDEX: 0x0010,
   VERTEX: 0x0020,
   UNIFORM: 0x0040,
-  STORAGE: 0x0080,
 } as const;
 
 const TEXTURE_USAGE = {
-  COPY_SRC: 0x01,
   COPY_DST: 0x02,
   TEXTURE_BINDING: 0x04,
-  STORAGE_BINDING: 0x08,
   RENDER_ATTACHMENT: 0x10,
 } as const;
+
+/** Offscreen format for the scene + bloom targets (universally filterable). */
+const SCENE_FORMAT: GPUTextureFormat = 'rgba8unorm';
 
 interface TextureEntry {
   texture: GPUTexture;
@@ -78,19 +74,23 @@ interface TextureEntry {
   height: number;
 }
 
-/** Byte layout must match `struct Instance` in shaders.ts (stride = 48). */
-const INSTANCE_FLOATS_PER_SPRITE = 12;
-const INSTANCE_STRIDE_BYTES = INSTANCE_FLOATS_PER_SPRITE * 4;
-const INITIAL_MAX_SPRITES = 4096;
-
 /** Unit quad corners as two triangles: (0,0)-(1,0)-(1,1) and (0,0)-(1,1)-(0,1). */
 const QUAD_CORNERS = new Float32Array([0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1]);
 
+interface EncodedBatch {
+  entry: TextureEntry;
+  additive: boolean;
+  startSprite: number;
+  spriteCount: number;
+}
+
 /**
- * WebGPU renderer skeleton with:
+ * WebGPU renderer with:
  *  - defensive init (navigator.gpu / adapter / device all guarded),
  *  - height-fills letterbox around a fixed 1280×720 virtual resolution,
- *  - one instanced quad/sprite pipeline ready for later waves.
+ *  - instanced sprite batching (one draw call per texture/blend group),
+ *  - bloom post-processing with graceful degradation,
+ *  - neon-glow sprites via additive blending + per-sprite glow color.
  */
 export class WebGPURenderer {
   private canvas!: HTMLCanvasElement;
@@ -98,12 +98,20 @@ export class WebGPURenderer {
   private device!: GPUDevice;
   private format!: GPUTextureFormat;
 
-  private pipeline!: GPURenderPipeline;
+  // Sprite pipeline resources.
+  private bglView!: GPUBindGroupLayout;
+  private bglTexture!: GPUBindGroupLayout;
+  private pipelineNormal!: GPURenderPipeline;
+  private pipelineAdditive!: GPURenderPipeline;
   private uniformBuffer!: GPUBuffer;
   private quadVertexBuffer!: GPUBuffer;
-  private instanceBuffer!: GPUBuffer;
-  private instanceStaging = new Float32Array(INITIAL_MAX_SPRITES * INSTANCE_FLOATS_PER_SPRITE);
-  private instanceCapacitySprites = INITIAL_MAX_SPRITES;
+  private batch: SpriteBatch | null = null;
+
+  // Offscreen scene target consumed by the post pass.
+  private sceneTexture: GPUTexture | null = null;
+  private sceneView: GPUTextureView | null = null;
+
+  private bloomPass: BloomPass | null = null;
 
   private textures = new Map<string, TextureEntry>();
   private queuedSprites = new Map<string, SpriteDraw[]>();
@@ -118,6 +126,7 @@ export class WebGPURenderer {
     bottom: VIRTUAL_HEIGHT,
   };
   private resizeObserver: ResizeObserver | null = null;
+  private uniformBindGroupCache: GPUBindGroup | null = null;
 
   // ------------------------------------------------------------------ init
 
@@ -183,51 +192,80 @@ export class WebGPURenderer {
   private createGpuObjects(): void {
     const module = this.device.createShaderModule({ code: SPRITE_SHADER_WGSL });
 
-    this.pipeline = this.device.createRenderPipeline({
-      layout: 'auto',
-      vertex: {
-        module,
-        entryPoint: 'vsMain',
-        buffers: [
-          {
-            // buffer 0: unit-quad corners
-            arrayStride: 2 * 4,
-            attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
-          },
-          {
-            // buffer 1: one instance per sprite
-            arrayStride: INSTANCE_STRIDE_BYTES,
-            stepMode: 'instance',
-            attributes: [
-              { shaderLocation: 1, offset: 0, format: 'float32x2' }, // pos
-              { shaderLocation: 2, offset: 8, format: 'float32x2' }, // size
-              { shaderLocation: 3, offset: 16, format: 'float32x2' }, // uv0
-              { shaderLocation: 4, offset: 24, format: 'float32x2' }, // uv1
-              { shaderLocation: 5, offset: 32, format: 'float32x4' }, // color
-            ],
-          },
-        ],
-      },
-      fragment: {
-        module,
-        entryPoint: 'fsMain',
-        targets: [
-          {
-            format: this.format,
-            blend: {
-              // Premultiplied-free alpha blending so parallax layers can stack.
-              color: {
-                srcFactor: 'src-alpha',
-                dstFactor: 'one-minus-src-alpha',
-                operation: 'add',
-              },
-              alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
-            },
-          },
-        ],
-      },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
+    this.bglView = this.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: 0x1 /* GPUShaderStage.VERTEX — numeric, not in TS DOM lib */,
+          buffer: { type: 'uniform' },
+        },
+      ],
     });
+    this.bglTexture = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: 0x2 /* FRAGMENT */, sampler: { type: 'filtering' } },
+        { binding: 1, visibility: 0x2 /* FRAGMENT */, texture: { sampleType: 'float' } },
+      ],
+    });
+    const pipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [this.bglView, this.bglTexture],
+    });
+
+    const vertexBuffers: GPUVertexBufferLayout[] = [
+      {
+        // buffer 0: unit-quad corners
+        arrayStride: 2 * 4,
+        attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x2' }],
+      },
+      {
+        // buffer 1: one instance per sprite (see INSTANCE_LAYOUT in SpriteBatch)
+        arrayStride: INSTANCE_STRIDE_BYTES,
+        stepMode: 'instance',
+        attributes: [
+          { shaderLocation: 1, offset: 0, format: 'float32x2' }, // pos
+          { shaderLocation: 2, offset: 8, format: 'float32x2' }, // size
+          { shaderLocation: 3, offset: 16, format: 'float32x2' }, // uv0
+          { shaderLocation: 4, offset: 24, format: 'float32x2' }, // uv1
+          { shaderLocation: 5, offset: 32, format: 'float32x4' }, // tint
+          { shaderLocation: 6, offset: 48, format: 'float32x4' }, // glow
+          { shaderLocation: 7, offset: 64, format: 'float32x4' }, // params
+        ],
+      },
+    ];
+
+    const makeSpritePipeline = (additive: boolean): GPURenderPipeline =>
+      this.device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: { module, entryPoint: 'vsMain', buffers: vertexBuffers },
+        fragment: {
+          module,
+          entryPoint: 'fsMain',
+          targets: [
+            {
+              format: SCENE_FORMAT,
+              blend: additive
+                ? {
+                    // Premultiplied additive: bright texels glow over the frame.
+                    color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                  }
+                : {
+                    // Standard alpha blending so parallax layers can stack.
+                    color: {
+                      srcFactor: 'src-alpha',
+                      dstFactor: 'one-minus-src-alpha',
+                      operation: 'add',
+                    },
+                    alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+                  },
+            },
+          ],
+        },
+        primitive: { topology: 'triangle-list', cullMode: 'none' },
+      });
+
+    this.pipelineNormal = makeSpritePipeline(false);
+    this.pipelineAdditive = makeSpritePipeline(true);
 
     this.uniformBuffer = this.device.createBuffer({
       size: 16, // vec4<f32> worth of ViewTransform
@@ -240,12 +278,13 @@ export class WebGPURenderer {
     });
     this.device.queue.writeBuffer(this.quadVertexBuffer, 0, QUAD_CORNERS);
 
-    this.instanceBuffer = this.createInstanceBuffer(this.instanceCapacitySprites);
+    this.batch = new SpriteBatch(this.device);
+    this.bloomPass = new BloomPass(this.device, this.format);
 
     // 1×1 white texture: lets tiles/rects draw as plain tinted quads.
     const white = this.device.createTexture({
       size: [1, 1],
-      format: 'rgba8unorm',
+      format: SCENE_FORMAT,
       usage: TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
     });
     this.device.queue.writeTexture(
@@ -254,14 +293,7 @@ export class WebGPURenderer {
       { bytesPerRow: 4, rowsPerImage: 1 },
       [1, 1],
     );
-    this.registerBindGroup('white', white, 1, 1, /* ownTexture */ true);
-  }
-
-  private createInstanceBuffer(spriteCount: number): GPUBuffer {
-    return this.device.createBuffer({
-      size: spriteCount * INSTANCE_STRIDE_BYTES,
-      usage: BUFFER_USAGE.VERTEX | BUFFER_USAGE.COPY_DST,
-    });
+    this.registerBindGroup('white', white, 1, 1, /* ownsTexture */ true);
   }
 
   private registerBindGroup(
@@ -278,7 +310,7 @@ export class WebGPURenderer {
       addressModeV: 'clamp-to-edge',
     });
     const bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(1),
+      layout: this.bglTexture,
       entries: [
         { binding: 0, resource: sampler },
         { binding: 1, resource: texture.createView() },
@@ -320,6 +352,35 @@ export class WebGPURenderer {
       top: 0,
       bottom: VIRTUAL_HEIGHT,
     };
+
+    this.ensureSceneTarget(pixelWidth, pixelHeight);
+  }
+
+  /** (Re)create the offscreen scene target when the canvas size changes. */
+  private ensureSceneTarget(pixelWidth: number, pixelHeight: number): void {
+    if (
+      this.sceneTexture &&
+      this.sceneTexture.width === pixelWidth &&
+      this.sceneTexture.height === pixelHeight &&
+      this.sceneView
+    ) {
+      return;
+    }
+    try {
+      this.sceneTexture?.destroy();
+      this.sceneTexture = this.device.createTexture({
+        size: [pixelWidth, pixelHeight],
+        format: SCENE_FORMAT,
+        usage:
+          TEXTURE_USAGE.TEXTURE_BINDING |
+          TEXTURE_USAGE.RENDER_ATTACHMENT |
+          TEXTURE_USAGE.COPY_DST,
+      });
+      this.sceneView = this.sceneTexture.createView();
+      this.bloomPass?.resize(pixelWidth, pixelHeight, this.sceneView);
+    } catch (error) {
+      console.error('[renderer] failed to resize offscreen scene target:', error);
+    }
   }
 
   private watchResize(): void {
@@ -336,17 +397,33 @@ export class WebGPURenderer {
     return this._viewBounds;
   }
 
+  // ------------------------------------------------------------- bloom API
+
+  /** Tune the bloom post-pass (values are sanitized/clamped). */
+  public setBloomOptions(patch: Partial<BloomParams>): void {
+    this.bloomPass?.configure(patch);
+  }
+
+  /** Read-only snapshot of bloom availability + current parameters. */
+  public get bloomState(): BloomState {
+    return {
+      available: this.bloomPass?.available ?? false,
+      params: this.bloomPass?.params ?? { threshold: 0, knee: 0, intensity: 0, radius: 0, downsample: 1 },
+    };
+  }
+
   // ------------------------------------------------------------- frame flow
 
   /** Begin a frame; clears to `clear` and prepares the sprite pipeline. */
   public beginFrame(clear: Rgba = [0.02, 0.01, 0.07, 1]): void {
-    if (!this.context) throw new WebGPURendererError('beginFrame called before init().');
+    if (!this.context || !this.batch) throw new WebGPURendererError('beginFrame called before init().');
+    if (!this.sceneView) throw new WebGPURendererError('beginFrame called with no scene target.');
 
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
-          view: this.context.getCurrentTexture().createView(),
+          view: this.sceneView,
           clearValue: { r: clear[0], g: clear[1], b: clear[2], a: clear[3] },
           loadOp: 'clear',
           storeOp: 'store',
@@ -354,7 +431,7 @@ export class WebGPURenderer {
       ],
     });
 
-    pass.setPipeline(this.pipeline);
+    pass.setPipeline(this.pipelineNormal);
     pass.setVertexBuffer(0, this.quadVertexBuffer);
 
     // Virtual-pixel → NDC transform over the current view bounds.
@@ -370,11 +447,10 @@ export class WebGPURenderer {
     this.renderPass = pass;
   }
 
-  private uniformBindGroupCache: GPUBindGroup | null = null;
   private makeUniformBindGroup(): GPUBindGroup {
     if (!this.uniformBindGroupCache) {
       this.uniformBindGroupCache = this.device.createBindGroup({
-        layout: this.pipeline.getBindGroupLayout(0),
+        layout: this.bglView,
         entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
       });
     }
@@ -383,7 +459,8 @@ export class WebGPURenderer {
 
   /**
    * Queue sprites drawn with `textureName` (registered via createTextureFromCanvas
-   * or the built-in 'white'). Actual GPU draws are batched per texture in endFrame.
+   * or the built-in 'white'). Actual draws are batched per (texture × blend mode)
+   * in endFrame — one instanced draw call per group.
    */
   public drawSprites(textureName: string, sprites: readonly SpriteDraw[]): void {
     if (!this.renderPass) throw new WebGPURendererError('drawSprites called outside begin/endFrame.');
@@ -393,78 +470,100 @@ export class WebGPURenderer {
     else this.queuedSprites.set(textureName, [...sprites]);
   }
 
-  /** Flush all queued sprite batches, submit, and present. */
+  /** Flush all queued sprite batches, run post-processing, submit, present. */
   public endFrame(): void {
     const pass = this.renderPass;
     const encoder = this.commandEncoder;
-    if (!pass || !encoder) throw new WebGPURendererError('endFrame called without beginFrame.');
-
-    for (const [textureName, sprites] of this.queuedSprites) {
-      const entry = this.textures.get(textureName);
-      if (!entry) {
-        console.warn(`[renderer] unknown texture "${textureName}" — skipping ${sprites.length} sprites`);
-        continue;
-      }
-
-      // Grow the instance buffer if this batch outgrew our staging area.
-      if (sprites.length > this.instanceCapacitySprites) {
-        this.instanceCapacitySprites = Math.max(sprites.length, this.instanceCapacitySprites * 2);
-        this.instanceBuffer.destroy();
-        this.instanceBuffer = this.createInstanceBuffer(this.instanceCapacitySprites);
-        this.instanceStaging = new Float32Array(
-          this.instanceCapacitySprites * INSTANCE_FLOATS_PER_SPRITE,
-        );
-      }
-
-      let f = 0;
-      for (const s of sprites) {
-        const tint = s.tint ?? [1, 1, 1, 1];
-        this.instanceStaging[f++] = s.x;
-        this.instanceStaging[f++] = s.y;
-        this.instanceStaging[f++] = s.width;
-        this.instanceStaging[f++] = s.height;
-        this.instanceStaging[f++] = s.u0 ?? 0;
-        this.instanceStaging[f++] = s.v0 ?? 0;
-        this.instanceStaging[f++] = s.u1 ?? 1;
-        this.instanceStaging[f++] = s.v1 ?? 1;
-        this.instanceStaging[f++] = tint[0];
-        this.instanceStaging[f++] = tint[1];
-        this.instanceStaging[f++] = tint[2];
-        this.instanceStaging[f++] = tint[3];
-      }
-
-      this.device.queue.writeBuffer(
-        this.instanceBuffer,
-        0,
-        this.instanceStaging.buffer,
-        0,
-        sprites.length * INSTANCE_STRIDE_BYTES,
-      );
-
-      pass.setBindGroup(1, entry.bindGroup);
-      pass.setVertexBuffer(1, this.instanceBuffer);
-      pass.draw(QUAD_CORNERS.length / 2, sprites.length); // 6 verts × N instances
+    const batch = this.batch;
+    if (!pass || !encoder || !batch || !this.sceneView) {
+      throw new WebGPURendererError('endFrame called without beginFrame.');
     }
-    this.queuedSprites.clear();
 
+    this.flushQueuedSprites(pass, batch);
     pass.end();
+
+    this.bloomPass?.encode(encoder, this.sceneView, this.getCurrentTextureView());
+
     this.device.queue.submit([encoder.finish()]);
     this.renderPass = null;
     this.commandEncoder = null;
+  }
+
+  /**
+   * Pack every queued group sequentially into the batch (one writeBuffer)
+   * then issue one instanced draw call per group. Unknown texture names are
+   * skipped with a warning instead of breaking the frame.
+   */
+  private flushQueuedSprites(pass: GPURenderPassEncoder, batch: SpriteBatch): void {
+    if (this.queuedSprites.size === 0) return;
+
+    interface PlannedBatch {
+      entry: TextureEntry;
+      additive: boolean;
+      quads: SpriteDraw[];
+    }
+    const planned: PlannedBatch[] = [];
+    let totalSprites = 0;
+
+    for (const [textureName, sprites] of this.queuedSprites) {
+      const tagged: TaggedQuad[] = [];
+      for (const quad of sprites) tagged.push({ textureName, quad });
+      for (const group of groupQuads(tagged)) {
+        const entry = this.textures.get(group.textureName);
+        if (!entry) {
+          console.warn(
+            `[renderer] unknown texture "${group.textureName}" — skipping ${group.quads.length} sprites`,
+          );
+          continue;
+        }
+        planned.push({ entry, additive: group.additive, quads: group.quads });
+        totalSprites += group.quads.length;
+      }
+    }
+    this.queuedSprites.clear();
+
+    if (planned.length === 0) return;
+
+    batch.ensureCapacity(totalSprites);
+    const encoded: EncodedBatch[] = [];
+    let cursor = 0;
+    for (const plan of planned) {
+      const start = cursor;
+      cursor = batch.pack(start, plan.quads);
+      encoded.push({
+        entry: plan.entry,
+        additive: plan.additive,
+        startSprite: start,
+        spriteCount: cursor - start,
+      });
+    }
+    batch.upload(cursor);
+
+    for (const draw of encoded) {
+      if (draw.spriteCount <= 0) continue;
+      pass.setPipeline(draw.additive ? this.pipelineAdditive : this.pipelineNormal);
+      pass.setBindGroup(1, draw.entry.bindGroup);
+      pass.setVertexBuffer(1, batch.gpuBuffer, draw.startSprite * INSTANCE_STRIDE_BYTES);
+      pass.draw(QUAD_CORNERS.length / 2, draw.spriteCount); // 6 verts × N instances
+    }
+  }
+
+  private getCurrentTextureView(): GPUTextureView {
+    return this.context.getCurrentTexture().createView();
   }
 
   // ----------------------------------------------------------- texture mgmt
 
   /**
    * Upload an offscreen/DOM canvas (e.g. a procedurally generated parallax
-   * layer) as a named GPU texture usable by the sprite pipeline.
+   * layer) as a named GPU texture usable by the sprite pipelines.
    */
   public createTextureFromCanvas(name: string, source: OffscreenCanvas | HTMLCanvasElement): void {
     const width = source.width;
     const height = source.height;
     const texture = this.device.createTexture({
       size: [width, height],
-      format: 'rgba8unorm',
+      format: SCENE_FORMAT,
       // RENDER_ATTACHMENT is required by copyExternalImageToTexture.
       usage:
         TEXTURE_USAGE.TEXTURE_BINDING |
