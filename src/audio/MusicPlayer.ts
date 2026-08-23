@@ -3,8 +3,9 @@
  *
  * One looping mp3 per level from `assets/music/`. The mp3 files themselves
  * arrive in Fas 5 (generated music), so the whole player is built around
- * *graceful absence*: an unknown or unloadable track logs a single console
- * warning and stays silent — gameplay never crashes on audio.
+ * *graceful absence*: an unknown track logs a single info-level notice and
+ * stays silent — gameplay never crashes on audio. Only genuine playback
+ * failures are warnings.
  *
  * Tracks are discovered by Vite's `import.meta.glob` over `assets/music/*.mp3`,
  * so dropping files into that folder later requires zero code changes here.
@@ -54,6 +55,12 @@ export interface MusicPlayerOptions {
   resolveTrackUrl?: TrackUrlResolver;
   /** Warning sink; defaults to console.warn. */
   onError?: (message: string) => void;
+  /**
+   * Info sink for *expected* absences (e.g. tracks arriving in a later
+   * phase); defaults to console.info. Kept separate from {@link onError}
+   * so QA consoles don't light up for by-design states.
+   */
+  onInfo?: (message: string) => void;
   /** Initial music volume, 0..1. */
   initialVolume?: number;
 }
@@ -69,19 +76,21 @@ export class MusicPlayer {
   private readonly createElement: MediaElementFactory;
   private readonly resolveTrackUrl: TrackUrlResolver;
   private readonly onError: (message: string) => void;
+  private readonly onInfo: (message: string) => void;
 
   private element: MediaElementLike | null = null;
   private currentId: string | null = null;
   private playing = false;
   private volume: number;
   private playToken = 0;
-  /** Tracks already warned about (missing/unloadable) to avoid log spam. */
+  /** Tracks already noted about (missing/unloadable) to avoid log spam. */
   private readonly warnedTracks = new Set<string>();
 
   public constructor(options: MusicPlayerOptions = {}) {
     this.createElement = options.createElement ?? defaultMediaElement;
     this.resolveTrackUrl = options.resolveTrackUrl ?? bundledTrackResolver;
     this.onError = options.onError ?? ((message) => console.warn(message));
+    this.onInfo = options.onInfo ?? ((message) => console.info(message));
     this.volume = clamp01(options.initialVolume ?? 0.8);
   }
 
@@ -96,7 +105,7 @@ export class MusicPlayer {
 
   /**
    * Switches to `trackId`, looping it. Returns true when playback actually
-   * started; false means the track is missing/broken (warned once, silent).
+   * started; false means the track is missing/broken (noted once, silent).
    */
   public async play(trackId: string): Promise<boolean> {
     if (!trackId) return false;
@@ -105,7 +114,8 @@ export class MusicPlayer {
     const token = ++this.playToken;
     const url = this.resolveTrackUrl(trackId);
     if (!url) {
-      this.warnOnce(trackId, `[audio] music track "${trackId}" not found in assets/music/ — staying silent`);
+      // Expected until the mp3s arrive in Fas 5 — info level, not an error.
+      this.noteOnce(trackId, `[audio] music track "${trackId}" not found in assets/music/ — staying silent`);
       this.stopInternal();
       return false;
     }
@@ -197,10 +207,18 @@ export class MusicPlayer {
     this.currentId = null;
   }
 
+  /** Warns once per track (genuine failures). */
   private warnOnce(trackId: string, message: string): void {
     if (this.warnedTracks.has(trackId)) return;
     this.warnedTracks.add(trackId);
     this.onError(message);
+  }
+
+  /** Notes once per track at info level (expected absences). */
+  private noteOnce(trackId: string, message: string): void {
+    if (this.warnedTracks.has(trackId)) return;
+    this.warnedTracks.add(trackId);
+    this.onInfo(message);
   }
 }
 

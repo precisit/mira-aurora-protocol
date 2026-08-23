@@ -116,6 +116,8 @@ class FakeAudioContext implements AudioContextLike {
 
   public resumeCount = 0;
   public closeCount = 0;
+  /** When set, resume() rejects like a browser refusing playback (autoplay etc.). */
+  public resumeError: Error | null = null;
   public readonly oscillators: FakeOscillator[] = [];
   public readonly gains: FakeGain[] = [];
   public readonly filters: FakeFilter[] = [];
@@ -123,6 +125,7 @@ class FakeAudioContext implements AudioContextLike {
 
   public async resume(): Promise<void> {
     this.resumeCount++;
+    if (this.resumeError) throw this.resumeError;
     this.state = 'running';
   }
 
@@ -218,16 +221,20 @@ interface Harness {
   elements: FakeMediaElement[];
   engine: AudioEngine;
   warnings: string[];
+  infos: string[];
   contextCreations: () => number;
 }
 
 function makeHarness(options?: {
   resolveTrackUrl?: TrackUrlResolver;
   failAllPlayback?: boolean;
+  resumeError?: Error | null;
 }): Harness {
   const ctx = new FakeAudioContext();
+  ctx.resumeError = options?.resumeError ?? null;
   const elements: FakeMediaElement[] = [];
   const warnings: string[] = [];
+  const infos: string[] = [];
   let creations = 0;
 
   const createElement: MediaElementFactory = () => {
@@ -246,9 +253,10 @@ function makeHarness(options?: {
     createMediaElement: createElement,
     resolveTrackUrl: options?.resolveTrackUrl ?? ((trackId) => `/music/${trackId}.mp3`),
     onError: (message) => warnings.push(message),
+    onInfo: (message) => infos.push(message),
   });
 
-  return { ctx, elements, engine, warnings, contextCreations: () => creations };
+  return { ctx, elements, engine, warnings, infos, contextCreations: () => creations };
 }
 
 async function unlockedHarness(options?: Parameters<typeof makeHarness>[0]): Promise<Harness> {
@@ -428,21 +436,74 @@ describe('AudioEngine — procedural SFX synthesis (headless)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Autoplay policy / resume failures (QA console noise regression)
+// ---------------------------------------------------------------------------
+
+describe('AudioEngine — autoplay-blocked resume stays quiet', () => {
+  it('logs nothing when resume() is blocked by the autoplay policy', async () => {
+    const harness = makeHarness({
+      // Chrome's exact rejection before the first user gesture.
+      resumeError: new Error('The AudioContext was not allowed to start.'),
+    });
+
+    await expect(harness.engine.unlock()).resolves.toBeUndefined();
+
+    expect(harness.ctx.resumeCount).toBe(1);
+    expect(harness.warnings).toHaveLength(0); // no error/warn spam
+    expect(harness.infos).toHaveLength(0);
+    expect(engineSilent(harness.engine)).toBe(true);
+  });
+
+  it('still unlocks on a later gesture once autoplay allows it', async () => {
+    const harness = makeHarness({
+      resumeError: new DOMExceptionLike('NotAllowedError'),
+    });
+    await harness.engine.unlock();
+    expect(engineSilent(harness.engine)).toBe(true);
+
+    harness.ctx.resumeError = null; // user finally gestured
+    await harness.engine.unlock(); // idempotent path re-resumes
+    expect(harness.engine.isUnlocked).toBe(true);
+    expect(harness.warnings).toHaveLength(0);
+  });
+
+  it('still warns for genuine resume failures (not autoplay)', async () => {
+    const harness = makeHarness({ resumeError: new Error('hardware sink vanished') });
+    await harness.engine.unlock();
+    expect(harness.warnings.some((m) => m.includes('could not resume'))).toBe(true);
+  });
+});
+
+/** True when SFX cannot be heard right now (context missing/suspended). */
+function engineSilent(engine: AudioEngine): boolean {
+  return !engine.isUnlocked;
+}
+
+/** Minimal stand-in for DOMException name semantics in plain Node. */
+class DOMExceptionLike extends Error {
+  public constructor(name: string) {
+    super(`${name}: playback blocked`);
+    this.name = name;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Music player framework
 // ---------------------------------------------------------------------------
 
 describe('AudioEngine — music player framework', () => {
-  it('missing mp3 warns once and stays silent (Fas 5 readiness)', async () => {
+  it('missing mp3 notes once at info level (tracks arrive in Fas 5)', async () => {
     const harness = makeHarness({ resolveTrackUrl: () => null });
 
     await expect(harness.engine.playMusic('level-1')).resolves.toBe(false);
     expect(harness.elements).toHaveLength(0);
-    expect(harness.warnings.filter((message) => message.includes('level-1'))).toHaveLength(1);
+    expect(harness.infos.filter((message) => message.includes('level-1'))).toHaveLength(1);
+    expect(harness.warnings).toHaveLength(0); // expected absence ≠ error
     expect(harness.engine.currentMusicTrack).toBeNull();
     expect(harness.engine.musicIsPlaying).toBe(false);
 
-    await harness.engine.playMusic('level-1'); // retry must not spam warnings
-    expect(harness.warnings.filter((message) => message.includes('level-1'))).toHaveLength(1);
+    await harness.engine.playMusic('level-1'); // retry must not spam notices
+    expect(harness.infos.filter((message) => message.includes('level-1'))).toHaveLength(1);
   });
 
   it('plays an injected track looping at the effective volume (master·music)', async () => {
