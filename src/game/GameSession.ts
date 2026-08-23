@@ -165,6 +165,21 @@ export class GameSession {
   private readonly checkpointList: CheckpointState[] = [];
   private exitBox: AABB | null = null;
 
+  // Hot-path scratch state (task C3): the per-step enemy context and the
+  // iteration snapshots below are preallocated once and reused every fixed
+  // step — update loops must not allocate.
+  /** Persistent EnemyStepContext; fields are refreshed each step. */
+  private readonly enemyCtx: {
+    level: Level;
+    playerCenter: { x: number; y: number };
+    dtSeconds: number;
+    rng: () => number;
+  };
+  /** Snapshot of enemies for safe iteration across world rebuilds. */
+  private readonly enemyScratch: Enemy[] = [];
+  /** Snapshot of projectiles for safe iteration across mid-loop spawns. */
+  private readonly projectileScratch: Projectile[] = [];
+
   /** Boss arena parsed from level data (task B2); null in plain levels. */
   private arenaSpawn: Extract<LevelData['spawns'][number], { kind: 'boss' }> | null = null;
   private _bossArena: ArenaBounds | null = null;
@@ -197,6 +212,13 @@ export class GameSession {
     this.player = new Player(spawn);
 
     this.particles = new ParticleSystem(this.rng);
+    // One context object + one closure for the whole session lifetime.
+    this.enemyCtx = {
+      level: this.level,
+      playerCenter: { x: 0, y: 0 },
+      dtSeconds: 0,
+      rng: () => this.rng.next(),
+    };
     this.buildWorldEntities();
 
     // Start the camera on the player so frame one is already framed.
@@ -293,12 +315,35 @@ export class GameSession {
     return this.enemies.filter((e) => e.active);
   }
 
+  /**
+   * The backing enemy array (C3): render/iterate hot paths skip inactive
+   * entries themselves instead of forcing a filtered copy per read.
+   */
+  public get enemiesView(): readonly Enemy[] {
+    return this.enemies;
+  }
+
   public get activeProjectiles(): readonly Projectile[] {
     return this.projectiles.active;
   }
 
+  /** Live projectile count without allocating (hot read, task C3). */
+  public get projectileCount(): number {
+    return this.projectiles.activeCount;
+  }
+
+  /** Backing projectile pool array for allocation-free render iteration (C3). */
+  public get projectilesView(): readonly Projectile[] {
+    return this.projectiles.itemsView;
+  }
+
   public get activePickups(): readonly Pickup[] {
     return this.pickups.filter((p) => p.active);
+  }
+
+  /** Backing pickup array for allocation-free render iteration (C3). */
+  public get pickupsView(): readonly Pickup[] {
+    return this.pickups;
   }
 
   /** Checkpoint bookkeeping (for rendering + respawn rules). */
@@ -449,7 +494,7 @@ export class GameSession {
     this.pickups.length = 0;
     this.checkpointList.length = 0;
     this.exitBox = null;
-    for (const item of this.projectiles.active) item.active = false;
+    for (const item of this.projectiles.itemsView) item.active = false;
     this.particles.clear();
 
     // Boss state re-arms with the world (attempt restarts reset the fight).
@@ -501,15 +546,19 @@ export class GameSession {
   }
 
   private updateEnemies(dtSeconds: number): void {
-    const ctx = {
-      level: this.level,
-      playerCenter: { x: this.player.centerX, y: this.player.centerY },
-      dtSeconds,
-      rng: () => this.rng.next(),
-    };
+    // Reuse the persistent context object — no per-step allocation (C3).
+    const ctx = this.enemyCtx;
+    ctx.level = this.level;
+    ctx.playerCenter.x = this.player.centerX;
+    ctx.playerCenter.y = this.player.centerY;
+    ctx.dtSeconds = dtSeconds;
 
-    // Iterate a snapshot: a killing blow can rebuild the world underneath us.
-    for (const enemy of [...this.enemies]) {
+    // Iterate a reusable snapshot: a killing blow can rebuild the world
+    // underneath us. Copying into the scratch array keeps this allocation-
+    // free while preserving the old spread-snapshot semantics.
+    const snapshot = snapshotInto(this.enemyScratch, this.enemies);
+    for (let i = 0; i < snapshot.length; i++) {
+      const enemy = snapshot[i]!;
       if (!enemy.active || this._status !== 'playing') continue;
       const fire = updateEnemy(enemy, ctx);
       if (fire && this._status === 'playing') this.spawnEnemyShot(fire);
@@ -691,11 +740,18 @@ export class GameSession {
   // ---------------------------------------------------------- projectiles --
 
   private updateProjectiles(dtSeconds: number): void {
-    // Snapshot: a lethal enemy shot can restart the attempt mid-loop.
-    for (const projectile of [...this.projectiles.active]) {
+    // Index iteration over the pool's backing array (C3): no snapshot spread,
+    // no filtered copy. Shots spawned during this loop are appended past
+    // `count` and simply run next step — same semantics as before.
+    const items = this.projectiles.itemsView;
+    const count = items.length;
+    for (let i = 0; i < count; i++) {
+      const projectile = items[i]!;
+      if (!projectile.active) continue;
       if (this._status !== 'playing') return;
       const result = updateProjectile(this.level, projectile, dtSeconds);
       if (!result.expired) {
+        if (!projectile.active) continue; // erased by another shot's pass
         if (projectile.owner === 'player') {
           this.resolvePlayerShot(projectile);
         } else {
@@ -720,7 +776,11 @@ export class GameSession {
   /** Deactivate every player shot overlapping `eraser`; true if any were. */
   private erasePlayerShots(eraser: Projectile): boolean {
     let erased = false;
-    for (const other of [...this.projectiles.active]) {
+    // Reusable snapshot (C3): deactivation mutates only flags, but the eraser
+    // itself can be deactivated below, so iterate the copied buffer.
+    const snapshot = snapshotInto(this.projectileScratch, this.projectiles.itemsView);
+    for (let i = 0; i < snapshot.length; i++) {
+      const other = snapshot[i]!;
       if (!other.active || other.owner !== 'player') continue;
       if (!projectileOverlaps(eraser, projectileBox(other))) continue;
       deactivateProjectile(other);
@@ -1208,4 +1268,14 @@ function pickupBoxExpanded(pickup: Pickup): AABB {
 
 function deactivateProjectile(p: Projectile): void {
   p.active = false;
+}
+
+/**
+ * Copy `source` into `out`, reusing `out`'s backing array (task C3: snapshot
+ * iteration without the per-step `[...source]` allocation). Returns `out`.
+ */
+function snapshotInto<T>(out: T[], source: readonly T[]): T[] {
+  out.length = source.length;
+  for (let i = 0; i < source.length; i++) out[i] = source[i]!;
+  return out;
 }

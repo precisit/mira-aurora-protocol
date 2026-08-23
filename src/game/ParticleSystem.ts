@@ -1,4 +1,4 @@
-import type { Rgba } from '../renderer/types';
+import type { Rgba, SpriteDraw } from '../renderer/types';
 
 /**
  * Pooled particle system (PLAN.md §6 "Objektpooling"; juice arrives fully in
@@ -6,7 +6,8 @@ import type { Rgba } from '../renderer/types';
  * fragment-bursts, projectile impacts, pickup sparkles, player death.
  *
  * Pure CPU simulation over typed data so it runs headless in tests; rendering
- * reads {@link ParticleSystem.active} and draws additive quads.
+ * reads {@link ParticleSystem.buildDraws} which fills a preallocated,
+ * stable-identity draw list (task C3: the render path never allocates).
  */
 
 export interface Particle {
@@ -57,6 +58,12 @@ export interface RandomSource {
 export class ParticleSystem {
   private readonly pool: Particle[] = [];
   private cursor = 0;
+  // Preallocated draw records (task C3): buildDraws() only mutates fields, so
+  // the render path performs zero allocations per frame. The view array is a
+  // truncation-safe alias — shrinking it must never drop pooled records.
+  private readonly draws: SpriteDraw[] = [];
+  private readonly drawView: SpriteDraw[] = [];
+  private readonly drawTints: Array<[number, number, number, number]> = [];
 
   public constructor(private readonly rng: RandomSource) {
     for (let i = 0; i < MAX_PARTICLES; i++) {
@@ -72,6 +79,18 @@ export class ParticleSystem {
         color: [1, 1, 1, 1],
         active: false,
       });
+      this.drawTints.push([1, 1, 1, 1]);
+      const record: SpriteDraw = {
+        x: 0,
+        y: 0,
+        width: 0,
+        height: 0,
+        tint: this.drawTints[i]!,
+        blend: 'additive',
+        glow: undefined,
+      };
+      this.draws.push(record);
+      this.drawView.push(record);
     }
   }
 
@@ -131,6 +150,49 @@ export class ParticleSystem {
     let n = 0;
     for (const p of this.pool) if (p.active) n++;
     return n;
+  }
+
+  /**
+   * The preallocated backing pool (stable record identities for the system's
+   * lifetime — the zero-allocation contract, assertable in tests).
+   */
+  public get poolView(): readonly Particle[] {
+    return this.pool;
+  }
+
+  /**
+   * Fill the reusable draw list with one additive quad per live particle and
+   * return it (task C3). The returned view array and its records keep stable
+   * identities for the system's lifetime — only field values change — so
+   * callers can hand it straight to `renderer.drawSprites` every frame
+   * without allocating. Truncating the *view* never drops pooled records.
+   */
+  public buildDraws(): readonly SpriteDraw[] {
+    const draws = this.draws;
+    const view = this.drawView;
+    let n = 0;
+    for (let i = 0; i < this.pool.length; i++) {
+      const p = this.pool[i]!;
+      if (!p.active) continue;
+      const fade = Math.max(0, Math.min(1, p.lifeSeconds / p.maxLifeSeconds));
+      const half = p.sizePx / 2;
+
+      const d = draws[n]!;
+      d.x = p.x - half;
+      d.y = p.y - half;
+      d.width = p.sizePx;
+      d.height = p.sizePx;
+      const tint = this.drawTints[n]!;
+      tint[0] = p.color[0];
+      tint[1] = p.color[1];
+      tint[2] = p.color[2];
+      tint[3] = fade;
+      d.tint = tint;
+      view[n] = d;
+      n += 1;
+    }
+    view.length = n;
+    return view;
   }
 
   public clear(): void {

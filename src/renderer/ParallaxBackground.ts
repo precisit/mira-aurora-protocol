@@ -341,6 +341,12 @@ export class ParallaxBackground {
   private lastFrameMs: number | null = null;
   /** Accumulated ambient drift phase per layer (virtual px). */
   private driftPhases = PARALLAX_LAYERS.map(() => 0);
+  // Per-layer reusable buffers (task C3): tile positions and sprite quads are
+  // filled in place every frame instead of being re-allocated.
+  private readonly tileXs: number[][] = PARALLAX_LAYERS.map(() => []);
+  private readonly tileDraws: SpriteDraw[][] = PARALLAX_LAYERS.map(() => []);
+  private readonly layerTints: Array<Array<[number, number, number, number]>> =
+    PARALLAX_LAYERS.map(() => []);
 
   public constructor(renderer: WebGPURenderer) {
     this.renderer = renderer;
@@ -405,19 +411,75 @@ export class ParallaxBackground {
       const rawOffset = this.smoothedCameraX * layer.scrollFactor + (this.driftPhases[i] ?? 0);
       const offset = wrapPeriod(rawOffset, layer.tileWidth);
 
-      const xs = computeTilePositions(bounds.left, bounds.right, layer.tileWidth, offset);
+      // Fill the layer's reusable buffers (no per-frame allocation, C3).
+      const xs = fillTilePositions(
+        this.tileXs[i]!,
+        bounds.left,
+        bounds.right,
+        layer.tileWidth,
+        offset,
+      );
       if (xs.length === 0) continue;
 
       const blend: SpriteDraw['blend'] = layer.additive ? 'additive' : 'normal';
-      const tiles: SpriteDraw[] = xs.map((x) => ({
-        x,
-        y: bounds.top,
-        width: layer.tileWidth,
-        height: viewHeight,
-        tint: [1, 1, 1, layer.alpha],
-        blend,
-      }));
+      const tiles = fillLayerTiles(this.tileDraws[i]!, this.layerTints[i]!, xs, bounds.top, viewHeight, layer, blend);
       this.renderer.drawSprites(layer.name, tiles);
     }
   }
+}
+
+/**
+ * Fill `out` with tile x positions covering [left, right) — allocation-free
+ * variant of {@link computeTilePositions} for the hot draw path.
+ */
+function fillTilePositions(
+  out: number[],
+  left: number,
+  right: number,
+  tileWidth: number,
+  offset: number,
+): number[] {
+  let n = 0;
+  if (tileWidth > 0 && Number.isFinite(left) && Number.isFinite(right) && right > left) {
+    const off = wrapPeriod(offset, tileWidth);
+    for (let x = left - off; x < right; x += tileWidth) {
+      out[n++] = x;
+    }
+  }
+  out.length = n;
+  return out;
+}
+
+/** Fill one layer's reusable sprite quads (and their tint tuples) in place. */
+function fillLayerTiles(
+  out: SpriteDraw[],
+  tints: Array<[number, number, number, number]>,
+  xs: readonly number[],
+  top: number,
+  height: number,
+  layer: ParallaxLayerSpec,
+  blend: SpriteDraw['blend'],
+): SpriteDraw[] {
+  for (let i = 0; i < xs.length; i++) {
+    let tint = tints[i];
+    if (!tint) {
+      tint = [1, 1, 1, layer.alpha];
+      tints.push(tint);
+    }
+    tint[3] = layer.alpha;
+
+    let quad = out[i];
+    if (!quad) {
+      quad = { x: 0, y: 0, width: 0, height: 0 };
+      out.push(quad);
+    }
+    quad.x = xs[i]!;
+    quad.y = top;
+    quad.width = layer.tileWidth;
+    quad.height = height;
+    quad.tint = tint;
+    quad.blend = blend;
+  }
+  out.length = xs.length;
+  return out;
 }

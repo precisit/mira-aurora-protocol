@@ -1,6 +1,7 @@
 import { GameLoop } from './core/GameLoop';
 import { GameStateMachine, GameStateName } from './core/GameState';
 import { attachLevelTimer, LevelTimer } from './core/Timer';
+import { sanitizeFpsCap } from './core/Perf';
 import { AudioEngine } from './audio/AudioEngine';
 import { JuiceSystem } from './effects/JuiceSystem';
 import { InputAction, InputManager } from './input/InputManager';
@@ -12,6 +13,7 @@ import {
   type Rgba,
   type SpriteDraw,
 } from './renderer/WebGPURenderer';
+import { copyRgba, setRgba, SpriteDrawPool } from './renderer/SpriteDrawPool';
 import { DomHud } from './ui/Hud';
 import { IntroSequence } from './ui/IntroSequence';
 import { SaveStore } from './save/SaveStore';
@@ -27,9 +29,7 @@ import { BOSS_DIALOGUE } from './ui/story';
 import { PLAYABLE_LEVELS } from './levels/levels';
 import type { EnemyTypeName, FragmentTypeName } from './game/entities';
 import { POWERUPS } from './game/entities';
-import type { Particle } from './game/ParticleSystem';
 import type { Pickup } from './game/pickups';
-import type { Projectile } from './game/Projectile';
 import './style.css';
 
 /**
@@ -64,6 +64,24 @@ const PLAYER_COLOR: Rgba = [0.45, 0.95, 1, 1];
 const PLAYER_CORE_COLOR: Rgba = [1, 1, 1, 1];
 const PROJECTILE_PLAYER_COLOR: Rgba = [0.7, 1, 1, 1];
 const PROJECTILE_ENEMY_COLOR: Rgba = [1, 0.4, 0.4, 1];
+
+// Static glow/palette tuples shared as read-only sprite fields (C3: packing
+// never mutates them, so one instance serves every frame).
+const FLASH_WHITE: Rgba = [1, 1, 1, 1];
+const WHITE_SPRITE_COLOR: Rgba = FLASH_WHITE;
+const CHECKPOINT_ACTIVE_GLOW: Rgba = [1.0, 0.92, 0.35, 2.2];
+const CHECKPOINT_INACTIVE_GLOW: Rgba = [1.0, 0.9, 0.3, 0.6];
+const EXIT_GLOW: Rgba = [0.55, 1.0, 0.45, 2.4];
+const CORE_EYE_GLOW: Rgba = [1, 1, 1, 2.2];
+const SHELL_TINT: Rgba = [0.55, 1, 1, 0.85];
+const SHELL_GLOW: Rgba = [0.55, 1, 1, 1.8];
+const AURA_GLOW: Rgba = [1, 0.9, 1, 2.5];
+const ERASER_FILL: Rgba = [0.02, 0.005, 0.05, 1];
+const ERASER_RIM: Rgba = [0.5, 0.2, 0.9, 1.4];
+const PLAYER_GLOW: Rgba = [PLAYER_COLOR[0], PLAYER_COLOR[1], PLAYER_COLOR[2], 1.6];
+const PLAYER_CORE_GLOW: Rgba = [1, 1, 1, 2];
+/** Reusable slot for the boss halo glow (rgb follows the body hue). */
+const bossHaloGlow: [number, number, number, number] = [1, 1, 1, 2];
 
 const CHECKPOINT_INACTIVE: Rgba = [1.0, 0.9, 0.3, 0.5];
 const CHECKPOINT_ACTIVE: Rgba = [1.0, 0.95, 0.45, 0.95];
@@ -102,6 +120,16 @@ async function boot(): Promise<void> {
     return;
   }
 
+  const save = new SaveStore();
+  // B3: single live SaveData blob — total score banks at level end and the
+  // unlock watcher below grants weapons the moment the (projected) total
+  // crosses a threshold. Unlocks only ever get added, never revoked.
+  let saveData = save.load();
+  save.save(saveData);
+
+  // C3 battery settings: persisted DPR cap (render at most N× CSS pixels).
+  renderer.setMaxDevicePixelRatio(saveData.settings.dprCap);
+
   // ---- World / systems -----------------------------------------------------
   const parallax = new ParallaxBackground(renderer);
   await parallax.generate();
@@ -110,12 +138,6 @@ async function boot(): Promise<void> {
   input.attach(window);
   const detachTouchUi = setupTouchControls(input);
 
-  const save = new SaveStore();
-  // B3: single live SaveData blob — total score banks at level end and the
-  // unlock watcher below grants weapons the moment the (projected) total
-  // crosses a threshold. Unlocks only ever get added, never revoked.
-  let saveData = save.load();
-  save.save(saveData);
   const audio = new AudioEngine();
   audio.applySettings(saveData.settings); // persisted volumes (SaveStore hook)
   const detachAudioUnlock = audio.initOnInteraction(window, () => {
@@ -328,7 +350,7 @@ async function boot(): Promise<void> {
     if (!session) return;
     const p = session.player;
 
-    const shotCount = session.activeProjectiles.length;
+    const shotCount = session.projectileCount;
     if (shotCount > prevProjectileCount) {
       const len = Math.hypot(lastAimX, lastAimY) || 1;
       juice.shoot(
@@ -352,6 +374,11 @@ async function boot(): Promise<void> {
   // Per-frame input latches: fixed-step updates may run 0..N times per frame,
   // so edge-triggered actions are captured once and explicitly consumed.
   const latches: FrameLatches = { jump: false, pause: false, confirm: false, swap: false };
+
+  // C3: DOM HUD refresh throttle (~10 Hz).
+  const HUD_INTERVAL_MS = 100;
+  let hudCooldownMs = HUD_INTERVAL_MS;
+  let hudPrimed = false;
   const refreshLatches = (): void => {
     latches.jump = input.wasPressed(InputAction.Jump);
     latches.pause = input.wasPressed(InputAction.Pause);
@@ -451,6 +478,15 @@ async function boot(): Promise<void> {
 
   // ---- Fixed-timestep loop --------------------------------------------------
   const loop = new GameLoop({
+    // C3 battery option from the persisted settings (null = uncapped);
+    // simulation keeps its fixed 120 Hz cadence regardless.
+    fpsCap: sanitizeFpsCap(saveData.settings.fpsCap),
+
+    // C3 telemetry: long frames (>50 ms) log once per stall episode.
+    onLongFrame: (frameDeltaMs) => {
+      console.warn(`[perf] long frame: ${frameDeltaMs.toFixed(1)} ms`);
+    },
+
     update(stepMs) {
       // Intro owns BOOT: advance it, and swallow the frame that ends it so a
       // skip keypress never leaks into the menu's "press SPACE to start".
@@ -540,7 +576,7 @@ async function boot(): Promise<void> {
       input.endFrame();
     },
 
-    render() {
+    render(_alpha, frameDeltaMs) {
       refreshLatches();
 
       // B4 intro owns BOOT: draw the cinematic over black and keep the HUD
@@ -566,6 +602,9 @@ async function boot(): Promise<void> {
 
       if (session) {
         renderer.drawSprites('white', buildWorldSprites(renderer, session, panX, offsetY));
+        // Gameplay particles reuse their pooled draw list (C3); drawn before
+        // boss overlays so beams/voids stay on top, matching previous order.
+        renderer.drawSprites('white', session.particles.buildDraws());
         drawBossOverlays(renderer, session, panX, offsetY);
         renderer.drawSprites('white', juice.particles.buildDraws());
         drawDarkness(renderer, session);
@@ -574,24 +613,39 @@ async function boot(): Promise<void> {
       renderer.endFrame();
 
       if (hudRoot) hudRoot.style.display = '';
-      hud.update({
-        gameStateName: state.current,
-        levelName: session?.level.data.name ?? '—',
-        fps: loop.fps,
-        cameraX,
-        message: currentMessage(),
-        score: session?.score.score,
-        lives: session?.lives,
-        weapon: session?.weapon.name,
-        comboMultiplier: session?.score.multiplier,
-        timeSeconds: session ? session.timeMs / 1000 : undefined,
-        timeText: timer.formatLevelTime(),
-        totalTimeText: timer.formatTotalTime(),
-        juiceLine: juice.statsLine(),
-        boss: session?.getBossHud() ?? null,
-      });
+      // C3: throttle DOM HUD writes to ~10 Hz — JSON diffing every frame at
+      // 120 Hz costs real time and churns strings for no visual gain.
+      hudCooldownMs += frameDeltaMs;
+      if (hudCooldownMs >= HUD_INTERVAL_MS || !hudPrimed) {
+        hudCooldownMs = 0;
+        hudPrimed = true;
+        hud.update({
+          gameStateName: state.current,
+          levelName: session?.level.data.name ?? '—',
+          fps: loop.fps,
+          cameraX,
+          message: currentMessage(),
+          score: session?.score.score,
+          lives: session?.lives,
+          weapon: session?.weapon.name,
+          comboMultiplier: session?.score.multiplier,
+          timeSeconds: session ? session.timeMs / 1000 : undefined,
+          timeText: timer.formatLevelTime(),
+          totalTimeText: timer.formatTotalTime(),
+          juiceLine: juice.statsLine(),
+          boss: session?.getBossHud() ?? null,
+        });
+      }
     },
   });
+
+  // C3: graceful GPU context loss mid-session — stop the loop and show a
+  // clear reload message instead of throwing in the render loop.
+  renderer.onDeviceLost = () => {
+    loop.stop();
+    canvas.classList.add('hidden');
+    WebGPURenderer.showContextLostMessage(fallbackHost ?? document.body);
+  };
 
   function currentMessage(): string | null {
     const now = performance.now();
@@ -631,15 +685,23 @@ async function boot(): Promise<void> {
 // World rendering: tiles + entities as batched neon sprites. `panX` is the
 // (shake-modified) camera X; `offsetY` is the shake Y applied to every world
 // sprite so vertical trauma moves the gameplay layer too.
+//
+// C3: every quad comes from a module-level SpriteDrawPool — records, tint
+// tuples and the draw arrays are reused across frames, so the render path
+// performs zero per-frame allocations after warmup. Draw order (painter's
+// algorithm) matches the previous literal-building implementation exactly.
 // ---------------------------------------------------------------------------
+
+const worldPool = new SpriteDrawPool(2048);
 
 function buildWorldSprites(
   renderer: WebGPURenderer,
   session: GameSession,
   panX: number,
   offsetY: number,
-): SpriteDraw[] {
-  const sprites: SpriteDraw[] = [];
+): readonly SpriteDraw[] {
+  const pool = worldPool;
+  pool.reset();
   const level = session.level;
   const camY = session.cameraY + offsetY;
   const bounds = renderer.viewBounds;
@@ -658,28 +720,34 @@ function buildWorldSprites(
         if (tile === TileType.Empty) continue;
         const x = Level.tileToWorldX(tx) - panX;
         switch (tile) {
-          case TileType.Solid:
-            sprites.push({
-              x,
-              y,
-              width: TILE_SIZE,
-              height: TILE_SIZE,
-              tint: (tx + ty) % 2 === 0 ? TINT_SOLID_A : TINT_SOLID_B,
-            });
+          case TileType.Solid: {
+            const solid = pool.next();
+            solid.x = x;
+            solid.y = y;
+            solid.width = TILE_SIZE;
+            solid.height = TILE_SIZE;
+            copyRgba(solid.tint, (tx + ty) % 2 === 0 ? TINT_SOLID_A : TINT_SOLID_B);
             break;
-          case TileType.Platform:
-            sprites.push({ x, y, width: TILE_SIZE, height: 10, tint: TINT_PLATFORM });
+          }
+          case TileType.Platform: {
+            const platform = pool.next();
+            platform.x = x;
+            platform.y = y;
+            platform.width = TILE_SIZE;
+            platform.height = 10;
+            copyRgba(platform.tint, TINT_PLATFORM);
             break;
-          case TileType.Hazard:
-            sprites.push({
-              x,
-              y: y + 6,
-              width: TILE_SIZE,
-              height: TILE_SIZE - 12,
-              tint: TINT_HAZARD,
-              glow: GLOW_HAZARD,
-            });
+          }
+          case TileType.Hazard: {
+            const hazard = pool.next();
+            hazard.x = x;
+            hazard.y = y + 6;
+            hazard.width = TILE_SIZE;
+            hazard.height = TILE_SIZE - 12;
+            copyRgba(hazard.tint, TINT_HAZARD);
+            hazard.glow = GLOW_HAZARD;
             break;
+          }
         }
       }
     }
@@ -687,109 +755,115 @@ function buildWorldSprites(
 
   // --- checkpoints & exit ---------------------------------------------------
   for (const checkpoint of session.checkpoints) {
-    sprites.push({
-      x: checkpoint.worldX + 10 - panX,
-      y: checkpoint.worldY - 32 - camY,
-      width: 12,
-      height: 64,
-      tint: checkpoint.activated ? CHECKPOINT_ACTIVE : CHECKPOINT_INACTIVE,
-      glow: checkpoint.activated ? [1.0, 0.92, 0.35, 2.2] : [1.0, 0.9, 0.3, 0.6],
-      blend: 'additive',
-    });
+    const marker = pool.next();
+    marker.x = checkpoint.worldX + 10 - panX;
+    marker.y = checkpoint.worldY - 32 - camY;
+    marker.width = 12;
+    marker.height = 64;
+    copyRgba(marker.tint, checkpoint.activated ? CHECKPOINT_ACTIVE : CHECKPOINT_INACTIVE);
+    marker.glow = checkpoint.activated ? CHECKPOINT_ACTIVE_GLOW : CHECKPOINT_INACTIVE_GLOW;
+    marker.blend = 'additive';
   }
   const exit = session.exitBoxOrNull;
   if (exit) {
-    sprites.push({
-      x: exit.x - panX,
-      y: exit.y - camY,
-      width: exit.width,
-      height: exit.height,
-      tint: EXIT_COLOR,
-      glow: [0.55, 1.0, 0.45, 2.4],
-      blend: 'additive',
-    });
+    const exitQuad = pool.next();
+    exitQuad.x = exit.x - panX;
+    exitQuad.y = exit.y - camY;
+    exitQuad.width = exit.width;
+    exitQuad.height = exit.height;
+    copyRgba(exitQuad.tint, EXIT_COLOR);
+    exitQuad.glow = EXIT_GLOW;
+    exitQuad.blend = 'additive';
   }
 
   // --- pickups ---------------------------------------------------------------
-  for (const pickup of session.activePickups) {
+  for (const pickup of session.pickupsView) {
+    if (!pickup.active) continue;
     const color = pickupColor(pickup);
-    sprites.push({
-      x: pickup.position.x - panX,
-      y: pickup.position.y - camY,
-      width: pickup.size.x,
-      height: pickup.size.y,
-      tint: color,
-      glow: color,
-      blend: 'additive',
-    });
+    const quad = pool.next();
+    quad.x = pickup.position.x - panX;
+    quad.y = pickup.position.y - camY;
+    quad.width = pickup.size.x;
+    quad.height = pickup.size.y;
+    copyRgba(quad.tint, color);
+    quad.glow = color;
+    quad.blend = 'additive';
   }
 
   // --- enemies -----------------------------------------------------------------
-  for (const enemy of session.activeEnemies) {
-    const base = ENEMY_COLORS_FALLBACK[enemy.kind as EnemyTypeName] ?? ([1, 1, 1, 1] as Rgba);
-    const flashing = enemy.hitFlashMs > 0;
-    const tint: Rgba = flashing ? [1, 1, 1, 1] : base;
-    sprites.push({
-      x: enemy.position.x - panX,
-      y: enemy.position.y - camY,
-      width: enemy.size.x,
-      height: enemy.size.y,
-      tint,
-      glow: tint,
-    });
+  for (const enemy of session.enemiesView) {
+    if (!enemy.active) continue;
+    const base = ENEMY_COLORS_FALLBACK[enemy.kind as EnemyTypeName] ?? WHITE_SPRITE_COLOR;
+    const quad = pool.next();
+    quad.x = enemy.position.x - panX;
+    quad.y = enemy.position.y - camY;
+    quad.width = enemy.size.x;
+    quad.height = enemy.size.y;
+    // Hit-flash reads as a white pop; otherwise glow shares the body color.
+    if (enemy.hitFlashMs > 0) {
+      copyRgba(quad.tint, FLASH_WHITE);
+      quad.glow = FLASH_WHITE;
+    } else {
+      copyRgba(quad.tint, base);
+      quad.glow = quad.tint;
+    }
   }
 
   // --- boss body ---------------------------------------------------------------
   const boss = session.boss;
   if (boss && boss.active) {
-    const base = BOSS_COLORS_FALLBACK[boss.bossId] ?? ([1, 1, 1, 1] as Rgba);
+    const base = BOSS_COLORS_FALLBACK[boss.bossId] ?? WHITE_SPRITE_COLOR;
     const box = boss.bodyBox();
     const flashing = boss.hitFlashMs > 0;
-    const bodyTint: Rgba = flashing ? [1, 1, 1, 1] : base;
-    sprites.push({
-      x: box.x - 6 - panX,
-      y: box.y - 6 - camY,
-      width: box.width + 12,
-      height: box.height + 12,
-      tint: [bodyTint[0], bodyTint[1], bodyTint[2], 0.4],
-      glow: [bodyTint[0], bodyTint[1], bodyTint[2], 2],
-      blend: 'additive',
-    });
-    sprites.push({ x: box.x - panX, y: box.y - camY, width: box.width, height: box.height, tint: bodyTint });
-    // Core eye.
-    sprites.push({
-      x: box.x + box.width / 2 - 7 - panX,
-      y: box.y + box.height / 2 - 7 - camY,
-      width: 14,
-      height: 14,
-      tint: PLAYER_CORE_COLOR,
-      glow: [1, 1, 1, 2.2],
-      blend: 'additive',
-    });
+
+    const halo = pool.next();
+    halo.x = box.x - 6 - panX;
+    halo.y = box.y - 6 - camY;
+    halo.width = box.width + 12;
+    halo.height = box.height + 12;
+    setRgba(halo.tint, base[0], base[1], base[2], 0.4);
+    // Glow shares the body hue with boosted strength (single reusable slot).
+    halo.glow = setRgba(bossHaloGlow, base[0], base[1], base[2], 2);
+    halo.blend = 'additive';
+
+    const body = pool.next();
+    body.x = box.x - panX;
+    body.y = box.y - camY;
+    body.width = box.width;
+    body.height = box.height;
+    copyRgba(body.tint, flashing ? FLASH_WHITE : base);
+
+    const eye = pool.next();
+    eye.x = box.x + box.width / 2 - 7 - panX;
+    eye.y = box.y + box.height / 2 - 7 - camY;
+    eye.width = 14;
+    eye.height = 14;
+    copyRgba(eye.tint, PLAYER_CORE_COLOR);
+    eye.glow = CORE_EYE_GLOW;
+    eye.blend = 'additive';
+
     // VESSEL's defensive shell reads as a sealed bracket around the body.
     if (boss.shellClosed) {
-      sprites.push({
-        x: box.x - 14 - panX,
-        y: box.y - 14 - camY,
-        width: box.width + 28,
-        height: box.height + 28,
-        tint: [0.55, 1, 1, 0.85],
-        glow: [0.55, 1, 1, 1.8],
-        blend: 'additive',
-      });
+      const shell = pool.next();
+      shell.x = box.x - 14 - panX;
+      shell.y = box.y - 14 - camY;
+      shell.width = box.width + 28;
+      shell.height = box.height + 28;
+      copyRgba(shell.tint, SHELL_TINT);
+      shell.glow = SHELL_GLOW;
+      shell.blend = 'additive';
     }
     // Phase-transition tell: surging white aura.
     if (boss.tellGlowMs > 0) {
       const pulse = 0.35 + 0.3 * Math.sin(session.timeMs / 60);
-      sprites.push({
-        x: box.x - 22 - panX,
-        y: box.y - 22 - camY,
-        width: box.width + 44,
-        height: box.height + 44,
-        tint: [1, 1, 1, pulse],
-        glow: [1, 0.9, 1, 2.5],
-        blend: 'additive',
-      });
+      const aura = pool.next();
+      aura.x = box.x - 22 - panX;
+      aura.y = box.y - 22 - camY;
+      aura.width = box.width + 44;
+      aura.height = box.height + 44;
+      setRgba(aura.tint, 1, 1, 1, pulse);
+      aura.glow = AURA_GLOW;
+      aura.blend = 'additive';
     }
   }
 
@@ -798,79 +872,60 @@ function buildWorldSprites(
   const blinkHidden =
     p.isInvulnerable && Math.floor(session.timeMs / 80) % 2 === 1;
   if (!blinkHidden) {
-    sprites.push({
-      x: p.x - 3 - panX,
-      y: p.y - 3 - camY,
-      width: p.width + 6,
-      height: p.height + 6,
-      tint: [PLAYER_COLOR[0], PLAYER_COLOR[1], PLAYER_COLOR[2], 0.5],
-      glow: [PLAYER_COLOR[0], PLAYER_COLOR[1], PLAYER_COLOR[2], 1.6],
-      blend: 'additive',
-    });
-    sprites.push({
-      x: p.x - panX,
-      y: p.y - camY,
-      width: p.width,
-      height: p.height,
-      tint: PLAYER_COLOR,
-    });
-    sprites.push({
-      x: p.centerX - 4 - panX,
-      y: p.centerY - 4 - camY,
-      width: 8,
-      height: 8,
-      tint: PLAYER_CORE_COLOR,
-      glow: [1, 1, 1, 2],
-      blend: 'additive',
-    });
+    const thruster = pool.next();
+    thruster.x = p.x - 3 - panX;
+    thruster.y = p.y - 3 - camY;
+    thruster.width = p.width + 6;
+    thruster.height = p.height + 6;
+    setRgba(thruster.tint, PLAYER_COLOR[0], PLAYER_COLOR[1], PLAYER_COLOR[2], 0.5);
+    thruster.glow = PLAYER_GLOW;
+    thruster.blend = 'additive';
+
+    const body = pool.next();
+    body.x = p.x - panX;
+    body.y = p.y - camY;
+    body.width = p.width;
+    body.height = p.height;
+    copyRgba(body.tint, PLAYER_COLOR);
+
+    const core = pool.next();
+    core.x = p.centerX - 4 - panX;
+    core.y = p.centerY - 4 - camY;
+    core.width = 8;
+    core.height = 8;
+    copyRgba(core.tint, PLAYER_CORE_COLOR);
+    core.glow = PLAYER_CORE_GLOW;
+    core.blend = 'additive';
   }
 
   // --- projectiles ----------------------------------------------------------------
-  const projectileSprites: SpriteDraw[] = session.activeProjectiles.map((shot: Projectile) => {
+  for (const shot of session.projectilesView) {
+    if (!shot.active) continue;
+    const quad = pool.next();
     if (shot.eraser) {
       // Absence shard: a hole in the world, faintly violet-edged.
-      return {
-        x: shot.position.x - 3 - panX,
-        y: shot.position.y - 3 - camY,
-        width: shot.size.x + 6,
-        height: shot.size.y + 6,
-        tint: [0.02, 0.005, 0.05, 1],
-        glow: [0.5, 0.2, 0.9, 1.4],
-      } satisfies SpriteDraw;
+      quad.x = shot.position.x - 3 - panX;
+      quad.y = shot.position.y - 3 - camY;
+      quad.width = shot.size.x + 6;
+      quad.height = shot.size.y + 6;
+      copyRgba(quad.tint, ERASER_FILL);
+      quad.glow = ERASER_RIM;
+    } else {
+      quad.x = shot.position.x - panX;
+      quad.y = shot.position.y - camY;
+      quad.width = shot.size.x;
+      quad.height = shot.size.y;
+      const color = shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR;
+      copyRgba(quad.tint, color);
+      quad.glow = color;
+      quad.blend = 'additive';
     }
-    return {
-      x: shot.position.x - panX,
-      y: shot.position.y - camY,
-      width: shot.size.x,
-      height: shot.size.y,
-      tint: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
-      glow: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
-      blend: 'additive',
-    };
-  });
-  pushAll(sprites, projectileSprites);
+  }
 
   // --- particles --------------------------------------------------------------------
-  const particleSprites: SpriteDraw[] = session.particles.active.map((particle: Particle) => ({
-    x: particle.x - particle.sizePx / 2 - panX,
-    y: particle.y - particle.sizePx / 2 - camY,
-    width: particle.sizePx,
-    height: particle.sizePx,
-    tint: [
-      particle.color[0],
-      particle.color[1],
-      particle.color[2],
-      Math.max(0, Math.min(1, particle.lifeSeconds / particle.maxLifeSeconds)),
-    ] as Rgba,
-    blend: 'additive',
-  }));
-  pushAll(sprites, particleSprites);
-
-  return sprites;
-}
-
-function pushAll(target: SpriteDraw[], items: readonly SpriteDraw[]): void {
-  target.push(...items);
+  // Game-session particles reuse their own preallocated draw list (C3); the
+  // juice system's list is drawn separately by the caller, same as before.
+  return pool.view();
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +937,14 @@ const LASER_COLOR: Rgba = [1, 0.35, 0.75, 1];
 const LASER_CORE: Rgba = [1, 0.95, 1, 1];
 const VOID_FILL: Rgba = [0.012, 0.004, 0.03, 0.94];
 const VOID_RIM: Rgba = [0.55, 0.25, 1, 0.5];
+const LASER_TELEGRAPH_GLOW: Rgba = [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 1.6];
+const LASER_BAND_GLOW: Rgba = [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 2.4];
+const LASER_CORE_GLOW: Rgba = [1, 1, 1, 2];
+
+// C3: pooled overlay quads — no per-frame array/object churn here either.
+const beamPool = new SpriteDrawPool(64);
+const voidPool = new SpriteDrawPool(64);
+const overlayQuadPool = new SpriteDrawPool(4);
 
 function drawBossOverlays(
   renderer: WebGPURenderer,
@@ -894,20 +957,20 @@ function drawBossOverlays(
   const camY = session.cameraY + offsetY;
 
   // --- laser beams ---------------------------------------------------------
-  const beamSprites: SpriteDraw[] = [];
+  const beams = beamPool;
+  beams.reset();
   for (const beam of boss.lasersSnapshot as readonly LaserBeam[]) {
     const telegraph = laserTelegraphBox(beam);
     if (telegraph) {
       const blink = 0.4 + 0.4 * Math.abs(Math.sin(beam.remainingMs / 90));
-      beamSprites.push({
-        x: telegraph.x - panX,
-        y: telegraph.y - camY,
-        width: telegraph.width,
-        height: telegraph.height,
-        tint: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], blink],
-        glow: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 1.6],
-        blend: 'additive',
-      });
+      const quad = beams.next();
+      quad.x = telegraph.x - panX;
+      quad.y = telegraph.y - camY;
+      quad.width = telegraph.width;
+      quad.height = telegraph.height;
+      setRgba(quad.tint, LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], blink);
+      quad.glow = LASER_TELEGRAPH_GLOW;
+      quad.blend = 'additive';
       continue;
     }
     const box =
@@ -921,40 +984,47 @@ function drawBossOverlays(
         : null;
     if (!box) continue;
     // Outer glow band + white-hot core line.
-    beamSprites.push({
-      x: box.x - 6 - panX,
-      y: box.y - 6 - camY,
-      width: box.width + 12,
-      height: box.height + 12,
-      tint: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 0.55],
-      glow: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 2.4],
-      blend: 'additive',
-    });
-    beamSprites.push({
-      x: box.x - panX,
-      y: box.y - camY,
-      width: box.width,
-      height: box.height,
-      tint: LASER_CORE,
-      glow: [1, 1, 1, 2],
-      blend: 'additive',
-    });
+    const band = beams.next();
+    band.x = box.x - 6 - panX;
+    band.y = box.y - 6 - camY;
+    band.width = box.width + 12;
+    band.height = box.height + 12;
+    setRgba(band.tint, LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 0.55);
+    band.glow = LASER_BAND_GLOW;
+    band.blend = 'additive';
+
+    const core = beams.next();
+    core.x = box.x - panX;
+    core.y = box.y - camY;
+    core.width = box.width;
+    core.height = box.height;
+    copyRgba(core.tint, LASER_CORE);
+    core.glow = LASER_CORE_GLOW;
+    core.blend = 'additive';
   }
-  renderer.drawSprites('white', beamSprites);
+  renderer.drawSprites('white', beams.view());
 
   // --- NULL's void zones (dark quads with a faint violet rim) ---------------
-  const voidSprites: SpriteDraw[] = [];
+  const voids = voidPool;
+  voids.reset();
   for (const zone of boss.hazardCircles()) {
     const d = zone.radiusPx * 2;
     if (zone.radiusPx <= 1) continue;
-    voidSprites.push(
-      { x: zone.centerX - zone.radiusPx - 3 - panX, y: zone.centerY - zone.radiusPx - 3 - camY,
-        width: d + 6, height: d + 6, tint: VOID_RIM },
-      { x: zone.centerX - zone.radiusPx - panX, y: zone.centerY - zone.radiusPx - camY,
-        width: d, height: d, tint: VOID_FILL },
-    );
+    const rim = voids.next();
+    rim.x = zone.centerX - zone.radiusPx - 3 - panX;
+    rim.y = zone.centerY - zone.radiusPx - 3 - camY;
+    rim.width = d + 6;
+    rim.height = d + 6;
+    copyRgba(rim.tint, VOID_RIM);
+
+    const fill = voids.next();
+    fill.x = zone.centerX - zone.radiusPx - panX;
+    fill.y = zone.centerY - zone.radiusPx - camY;
+    fill.width = d;
+    fill.height = d;
+    copyRgba(fill.tint, VOID_FILL);
   }
-  renderer.drawSprites('white', voidSprites);
+  renderer.drawSprites('white', voids.view());
 }
 
 /** Fullscreen darkening while NULL's darkness waves peak. */
@@ -962,15 +1032,13 @@ function drawDarkness(renderer: WebGPURenderer, session: GameSession): void {
   const darkness = session.darknessLevel;
   if (darkness <= 0.01) return;
   const bounds = renderer.viewBounds;
-  renderer.drawSprites('white', [
-    {
-      x: bounds.left,
-      y: bounds.top,
-      width: bounds.right - bounds.left,
-      height: bounds.bottom - bounds.top,
-      tint: [0.01, 0, 0.04, Math.min(0.78, darkness * 0.72)],
-    },
-  ]);
+  const quad = overlayQuadPool.next();
+  quad.x = bounds.left;
+  quad.y = bounds.top;
+  quad.width = bounds.right - bounds.left;
+  quad.height = bounds.bottom - bounds.top;
+  setRgba(quad.tint, 0.01, 0, 0.04, Math.min(0.78, darkness * 0.72));
+  renderer.drawSprites('white', overlayQuadPool.view());
 }
 
 function pickupColor(pickup: Pickup): Rgba {
