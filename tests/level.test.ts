@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { Level, parseAsciiLevel } from '../src/levels/Level';
-import { ASCII_TILES, TILE_SIZE, TileType } from '../src/levels/LevelData';
-import { createTestLevel, TEST_LEVEL_PIXEL_SIZE } from '../src/levels/TestLevel';
+import { ASCII_TILES, SPAWN_CHARS, TILE_SIZE, TileType } from '../src/levels/LevelData';
+import { getLevel } from '../src/levels/levels';
 
 function requirePoint(point: { x: number; y: number } | undefined): { x: number; y: number } {
-  if (!point) throw new Error('expected marker world position to exist');
+  if (!point) throw new Error('expected spawn world position to exist');
   return point;
 }
 
@@ -40,7 +40,7 @@ describe('tilemap coordinate conversion', () => {
   });
 
   it('treats out-of-bounds as solid except above the level (open sky)', () => {
-    const level = new Level(createTestLevel());
+    const level = new Level(getLevel(1));
     expect(level.tileAt(-1, 10)).toBe(TileType.Solid); // left wall
     expect(level.tileAt(level.widthTiles + 3, 10)).toBe(TileType.Solid); // right wall
     expect(level.tileAt(10, level.heightTiles + 2)).toBe(TileType.Solid); // below
@@ -58,43 +58,71 @@ describe('ASCII level parsing', () => {
         '.....',
         '.###.',
         '..S..',
-        'C...G',
-        '^^^..',
+        'C.d.1',
+        '^^J.G',
+        '==2..',
       ],
+      { parTimeSeconds: 45 },
     ),
   );
 
   it('builds a rectangular grid from ragged rows', () => {
     expect(parsed.widthTiles).toBe(5);
-    expect(parsed.heightTiles).toBe(5);
+    expect(parsed.heightTiles).toBe(6);
     expect(parsed.data.tiles.every((row) => row.length === 5)).toBe(true);
   });
 
   it('decodes tiles per the legend', () => {
     expect(parsed.tileAt(1, 1)).toBe(ASCII_TILES['#']);
     expect(parsed.tileAt(0, 4)).toBe(ASCII_TILES['^']);
+    expect(parsed.tileAt(0, 5)).toBe(ASCII_TILES['=']);
   });
 
-  it('turns S/C/G into markers on empty tiles', () => {
-    expect(parsed.data.markers).toContainEqual({ kind: 'spawn', tx: 2, ty: 2 });
-    expect(parsed.data.markers).toContainEqual({ kind: 'checkpoint', tx: 0, ty: 3 });
-    expect(parsed.data.markers).toContainEqual({ kind: 'goal', tx: 4, ty: 3 });
-    expect(parsed.tileAt(2, 2)).toBe(TileType.Empty); // markers are not solid
+  it('turns legend characters into spawn-layer entries on empty tiles', () => {
+    const spawns = parsed.data.spawns;
+    expect(spawns).toContainEqual({ kind: 'playerSpawn', tx: 2, ty: 2 });
+    expect(spawns).toContainEqual({ kind: 'checkpoint', tx: 0, ty: 3 });
+    expect(spawns).toContainEqual({ kind: 'enemy', enemy: 'Drone', tx: 2, ty: 3 });
+    expect(spawns).toContainEqual({ kind: 'fragment', fragment: 'Music', tx: 4, ty: 3 });
+    expect(spawns).toContainEqual({ kind: 'unlock', unlock: 'DoubleJumpUnlock', tx: 2, ty: 4 });
+    expect(spawns).toContainEqual({ kind: 'exit', tx: 4, ty: 4 });
+    expect(spawns).toContainEqual({ kind: 'fragment', fragment: 'Science', tx: 2, ty: 5 });
+    expect(parsed.tileAt(2, 2)).toBe(TileType.Empty); // spawn chars are not solid
   });
 
-  it('exposes marker world positions via the level helper', () => {
-    expect(parsed.markerWorld('spawn')).toEqual(Level.tileCenter(2, 2));
-    expect(parsed.markerWorld('checkpoint')).toBeDefined();
+  it('exposes structural spawn world positions via the level helper', () => {
+    expect(parsed.spawnPoint()).toEqual(Level.tileCenter(2, 2));
+    expect(parsed.firstCheckpointWorld()).toEqual(Level.tileCenter(0, 3));
+    expect(parsed.exitPoint()).toEqual(Level.tileCenter(4, 4));
+  });
+
+  it('covers every legend character with a spawn factory', () => {
+    for (const ch of 'SCGJOVMTUdwgp1234567') {
+      expect(SPAWN_CHARS[ch], `missing factory for '${ch}'`).toBeDefined();
+    }
   });
 });
 
-describe('Fas 0 test level data', () => {
-  const level = new Level(createTestLevel());
+describe('level 1 replaces the Fas-0 test level as boot level', () => {
+  const level = new Level(getLevel(1));
 
-  it('has sane dimensions matching its declared size', () => {
-    expect(level.pixelWidth).toBe(TEST_LEVEL_PIXEL_SIZE.width);
+  it('has sane pixel dimensions derived from its tile size', () => {
+    expect(level.pixelWidth).toBe(level.widthTiles * TILE_SIZE);
+    expect(level.pixelHeight).toBe(level.heightTiles * TILE_SIZE);
     expect(level.heightTiles).toBe(level.data.tiles.length);
     expect(level.data.tiles.every((row) => row.length === level.widthTiles)).toBe(true);
+  });
+
+  it('places spawn on safe ground with checkpoints and an exit', () => {
+    const spawn = requirePoint(level.spawnPoint());
+    // Spawn tile itself must be empty with solid ground directly beneath.
+    expect(level.isSolidAtWorld(spawn.x, spawn.y)).toBe(false);
+    expect(level.isSolidAtWorld(spawn.x, spawn.y + TILE_SIZE)).toBe(true);
+
+    expect(level.data.spawns.filter((m) => m.kind === 'checkpoint').length).toBeGreaterThanOrEqual(
+      2,
+    );
+    expect(level.exitPoint()).toBeDefined();
   });
 
   it('contains ground, platforms and hazards', () => {
@@ -111,15 +139,5 @@ describe('Fas 0 test level data', () => {
     expect(solid).toBeGreaterThan(100);
     expect(platform).toBeGreaterThan(15);
     expect(hazard).toBeGreaterThan(5);
-  });
-
-  it('places spawn on safe ground with checkpoints and a goal', () => {
-    const spawn = requirePoint(level.markerWorld('spawn'));
-    // Spawn tile itself must be empty with solid ground directly beneath.
-    expect(level.isSolidAtWorld(spawn.x, spawn.y)).toBe(false);
-    expect(level.isSolidAtWorld(spawn.x, spawn.y + TILE_SIZE)).toBe(true);
-
-    expect(level.data.markers.filter((m) => m.kind === 'checkpoint').length).toBeGreaterThanOrEqual(2);
-    expect(level.markerWorld('goal')).toBeDefined();
   });
 });

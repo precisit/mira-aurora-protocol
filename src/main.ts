@@ -2,7 +2,7 @@ import { GameLoop } from './core/GameLoop';
 import { GameStateMachine, GameStateName } from './core/GameState';
 import { AudioEngine } from './audio/AudioEngine';
 import { InputAction, InputManager } from './input/InputManager';
-import { createTestLevel } from './levels/TestLevel';
+import { getLevel } from './levels/levels';
 import { Level } from './levels/Level';
 import { TILE_SIZE, TileType } from './levels/LevelData';
 import { ParallaxBackground } from './renderer/ParallaxBackground';
@@ -19,9 +19,9 @@ import './style.css';
 /**
  * Aurora Protocol — Fas 0 bootstrap.
  *
- * Boots the WebGPU renderer, generates the five parallax layers, loads the
- * test level and starts a fixed-timestep loop that slowly pans the camera
- * across it. Background + tiles are visible; the player entity arrives in
+ * Boots the WebGPU renderer, generates the five parallax layers, loads
+ * level 1 ("Mnemosynes fall") and starts a fixed-timestep loop that slowly
+ * pans the camera across it. Background + tiles are visible; the player entity arrives in
  * wave A. State machine: BOOT → MENU → (Space) PLAYING ⇄ PAUSED.
  */
 
@@ -38,6 +38,8 @@ const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.9];
 const GLOW_MARKER_CHECKPOINT: Rgba = [1.0, 0.92, 0.35, 2.2];
 const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.95];
 const GLOW_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 2.6];
+const TINT_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 0.8];
+const GLOW_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 2.4];
 
 interface DemoState {
   cameraX: number;
@@ -64,7 +66,7 @@ async function boot(): Promise<void> {
   const parallax = new ParallaxBackground(renderer);
   await parallax.generate();
 
-  const level = new Level(createTestLevel());
+  const level = new Level(getLevel(1));
   const input = new InputManager();
   input.attach(window);
   const save = new SaveStore();
@@ -125,19 +127,28 @@ async function boot(): Promise<void> {
       }
     }
 
-    // Checkpoints & goal as additive glowing markers so the data is visible
+    // Spawn-layer entities as additive glowing markers so the data is visible
     // in-demo (exercises the neon-glow sprite path from the A1 wave).
-    for (const marker of level.data.markers) {
-      if (marker.kind === 'spawn') continue;
-      const isCheckpoint = marker.kind === 'checkpoint';
+    for (const spawn of level.data.spawns) {
+      if (spawn.kind === 'playerSpawn') continue;
+      const isCheckpoint = spawn.kind === 'checkpoint';
+      const isExit = spawn.kind === 'exit';
       const height = TILE_SIZE * 2;
       sprites.push({
-        x: Level.tileToWorldX(marker.tx) + 10 - demo.cameraX,
-        y: Level.tileToWorldY(marker.ty + 1) - height,
+        x: Level.tileToWorldX(spawn.tx) + 10 - demo.cameraX,
+        y: Level.tileToWorldY(spawn.ty + 1) - height,
         width: 12,
         height,
-        tint: isCheckpoint ? TINT_MARKER_CHECKPOINT : TINT_MARKER_GOAL,
-        glow: isCheckpoint ? GLOW_MARKER_CHECKPOINT : GLOW_MARKER_GOAL,
+        tint: isCheckpoint
+          ? TINT_MARKER_CHECKPOINT
+          : isExit
+            ? TINT_MARKER_GOAL
+            : TINT_MARKER_PICKUP,
+        glow: isCheckpoint
+          ? GLOW_MARKER_CHECKPOINT
+          : isExit
+            ? GLOW_MARKER_GOAL
+            : GLOW_MARKER_PICKUP,
         blend: 'additive',
       });
     }
