@@ -38,6 +38,9 @@ const PURGER_BOB_AMPLITUDE_PX = 9;
 
 // ------------------------------------------------------------- model --
 
+/** Monotonic enemy id source — see {@link spawnEnemyAt}. */
+let nextEnemyId = 1;
+
 export interface Enemy extends Entity {
   readonly kind: EnemyTypeName;
   hp: number;
@@ -112,7 +115,9 @@ export function spawnEnemyAt(
   const y = tileCenterPoint.y - size.height / 2;
 
   return {
-    id: 0,
+    // Unique per enemy (B3): weapon behaviors key their per-shot
+    // already-hit lists on this id (pierce/splash de-dup).
+    id: nextEnemyId++,
     kind,
     position: { x, y },
     velocity: { x: 0, y: 0 },

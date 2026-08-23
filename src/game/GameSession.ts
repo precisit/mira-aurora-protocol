@@ -3,10 +3,14 @@ import { Player, emptyPlayerInput, type PlayerInput } from './Player';
 import {
   createProjectile,
   launchProjectile,
+  launchSplitChild,
+  launchWeaponProjectile,
   updateProjectile,
+  projectileCenter,
   projectileOverlaps,
   projectileBox,
   type Projectile,
+  type SplitChildSpec,
 } from './Projectile';
 import {
   damageEnemy,
@@ -21,7 +25,17 @@ import { animatePickup, createPickupsFromSpawns, type Pickup } from './pickups';
 import { CHECKPOINT_BONUS, ScoreTracker, type SfxSink } from './score';
 import { ParticleSystem } from './ParticleSystem';
 import { touchesHazard } from './collision';
-import { WEAPONS, DEFAULT_WEAPON_ID, aimDirection } from './weapons';
+import {
+  DEFAULT_WEAPON_ID,
+  WEAPONS,
+  WEAPON_ORDER,
+  aimDirection,
+  chargeFraction,
+  spreadDirections,
+  type WeaponColor,
+  type WeaponDef,
+  type WeaponId,
+} from './weapons';
 import { ENEMY_COLORS_FALLBACK } from './renderPalette';
 import {
   ABILITY_UNLOCKS,
@@ -94,6 +108,8 @@ export type SessionStatus = 'playing' | 'levelComplete' | 'gameOver';
 export type GameEvent =
   | { type: 'checkpoint-activated'; index: number }
   | { type: 'unlock-granted'; unlock: string }
+  | { type: 'weapon-unlocked'; weaponId: WeaponId }
+  | { type: 'explosion'; x: number; y: number; radiusPx: number }
   | { type: 'powerup-collected'; powerup: PowerupTypeName }
   | { type: 'fragment-collected'; fragment: FragmentTypeName }
   | { type: 'enemy-killed'; kind: string }
@@ -120,6 +136,11 @@ export interface GameSessionOptions {
   hooks?: SessionHooks;
   /** Seed for deterministic particle/teleport randomness. */
   seed?: number;
+  /**
+   * Weapon ids currently unlocked by total score (B3). Only these can be
+   * cycled/selectable; defaults to the starting weapon alone.
+   */
+  unlockedWeapons?: readonly string[];
 }
 
 interface CheckpointState {
@@ -159,10 +180,17 @@ export class GameSession {
   private _cameraY = 0;
   private _killsThisSession = 0;
 
+  // B3 weapon state: equipped id, unlock set (external, score-driven) and
+  // hold-to-charge accumulator for Nova.
+  private _weaponId: WeaponId = DEFAULT_WEAPON_ID;
+  private readonly unlockedWeaponIds = new Set<WeaponId>([DEFAULT_WEAPON_ID]);
+  private chargeMs = 0;
+
   public constructor(options: GameSessionOptions) {
     this.level = new Level(options.levelData);
     this.hooks = options.hooks ?? {};
     this.rng = new SeededRng(options.seed ?? 0xa7001);
+    if (options.unlockedWeapons) this.setUnlockedWeapons(options.unlockedWeapons);
 
     const spawn = this.level.spawnPoint();
     if (!spawn) throw new Error(`GameSession: level "${options.levelData.id}" has no playerSpawn`);
@@ -201,6 +229,64 @@ export class GameSession {
 
   public get kills(): number {
     return this._killsThisSession;
+  }
+
+  // -------------------------------------------------------------- weapons --
+
+  /** Equipped weapon id (always one of the unlocked set). */
+  public get weaponId(): WeaponId {
+    return this._weaponId;
+  }
+
+  /** Equipped weapon definition. */
+  public get weapon(): WeaponDef {
+    return WEAPONS[this._weaponId];
+  }
+
+  /** Unlocked weapon ids, in unlock-threshold order. */
+  public get unlockedWeapons(): WeaponId[] {
+    return WEAPON_ORDER.filter((id) => this.unlockedWeaponIds.has(id));
+  }
+
+  /** Nova-style charge progress 0..1 (1 for instant-fire weapons). */
+  public get chargeFraction(): number {
+    return chargeFraction(this.chargeMs, this.weapon.chargeMs);
+  }
+
+  /**
+   * Cycle to the next/previous unlocked weapon in threshold order. Returns
+   * false when there is nothing else to switch to (single-weapon arsenal).
+   */
+  public cycleWeapon(step: number = 1): boolean {
+    const arsenal = this.unlockedWeapons;
+    if (arsenal.length < 2) return false;
+    const index = arsenal.indexOf(this._weaponId);
+    const next = arsenal[(index + step + arsenal.length * Math.abs(step)) % arsenal.length]!;
+    return this.equipWeapon(next);
+  }
+
+  /** Direct selection; refuses locked weapons. */
+  public selectWeapon(weaponId: WeaponId): boolean {
+    if (!this.unlockedWeaponIds.has(weaponId)) return false;
+    return this.equipWeapon(weaponId);
+  }
+
+  /**
+   * Merge externally-unlocked ids into the session set (additive — unlocks
+   * never go backwards). If the equipped weapon is not in the merged set,
+   * falls back to the highest-tier unlocked one.
+   */
+  public setUnlockedWeapons(weaponIds: readonly string[]): void {
+    for (const id of weaponIds) {
+      if (Object.prototype.hasOwnProperty.call(WEAPONS, id)) {
+        this.unlockedWeaponIds.add(id as WeaponId);
+      }
+    }
+    if (!this.unlockedWeaponIds.has(this._weaponId)) {
+      const fallback = this.unlockedWeapons.at(-1) ?? DEFAULT_WEAPON_ID;
+      this._weaponId = fallback;
+      this.chargeMs = 0;
+    }
   }
 
   public get activeEnemies(): readonly Enemy[] {
@@ -283,7 +369,7 @@ export class GameSession {
       return;
     }
 
-    this.handleShooting(input);
+    this.handleShooting(input, stepMs);
     this.updateBossFight(dtSeconds);
     if (this._status !== 'playing') return;
     this.updateEnemies(dtSeconds);
@@ -296,34 +382,64 @@ export class GameSession {
 
   // ------------------------------------------------------------ shooting --
 
-  private handleShooting(input: PlayerInput): void {
-    const weapon = WEAPONS[DEFAULT_WEAPON_ID];
+  private handleShooting(input: PlayerInput, stepMs: number): void {
     const p = this.player;
+    const weapon = this.weapon;
+
+    // Hold-to-charge (Nova): builds while the trigger is held and the gun is
+    // ready; auto-fires the big blast at 100 % and resets. Releasing early
+    // or firing drops the charge.
+    if (weapon.chargeMs > 0) {
+      if (!input.shootHeld || p.weapon.cooldownMs > 0) {
+        this.chargeMs = 0;
+        return;
+      }
+      this.chargeMs += Math.max(0, stepMs);
+      if (this.chargeFraction < 1) return;
+      this.chargeMs = 0;
+      this.fireVolley(weapon, input);
+      p.weapon.cooldownMs = this.cooldownFor(weapon, p);
+      return;
+    }
+
     if (!input.shootHeld || p.weapon.cooldownMs > 0) return;
 
-    const overcharged = p.effects.overchargeMs > 0;
-    const direction =
-      input.aim ??
-      ({ x: p.facing, y: 0 } as const);
+    this.fireVolley(weapon, input);
+    p.weapon.cooldownMs = this.cooldownFor(weapon, p);
+  }
 
+  /** Overcharge powerup halves every weapon's cooldown (WeaponDef contract). */
+  private cooldownFor(weapon: WeaponDef, p: Player): number {
+    const overcharged = p.effects.overchargeMs > 0;
+    return overcharged ? weapon.cooldownMs / 2 : weapon.cooldownMs;
+  }
+
+  /** Fire one trigger pull: a fan of `spreadCount` weapon projectiles. */
+  private fireVolley(weapon: WeaponDef, input: PlayerInput): void {
+    const p = this.player;
+    const direction = input.aim ?? ({ x: p.facing, y: 0 } as const);
     const muzzle: { x: number; y: number } = {
       x: p.centerX + direction.x * 14,
       y: p.centerY + direction.y * 14,
     };
+    const baseDirection = aimDirection(muzzle, {
+      x: muzzle.x + direction.x * 100,
+      y: muzzle.y + direction.y * 100,
+    });
 
-    const shot = this.projectiles.spawn();
-    launchProjectile(
-      shot,
-      'player',
-      muzzle,
-      aimDirection(muzzle, { x: muzzle.x + direction.x * 100, y: muzzle.y + direction.y * 100 }),
-      weapon.projectileSpeedPxPerS,
-      weapon.damage,
-      weapon.lifetimeSeconds,
-    );
+    for (const dir of spreadDirections(baseDirection, weapon.spreadCount, weapon.spreadAngleDeg)) {
+      launchWeaponProjectile(this.projectiles.spawn(), weapon, muzzle, dir);
+    }
 
-    p.weapon.cooldownMs = overcharged ? weapon.cooldownMs / 2 : weapon.cooldownMs;
     this.hooks.sfx?.('shoot');
+  }
+
+  private equipWeapon(weaponId: WeaponId): boolean {
+    if (weaponId === this._weaponId) return false;
+    this._weaponId = weaponId;
+    this.chargeMs = 0;
+    this.hooks.sfx?.('weapon-switch');
+    return true;
   }
 
   // ------------------------------------------------------------- enemies --
@@ -579,23 +695,25 @@ export class GameSession {
     for (const projectile of [...this.projectiles.active]) {
       if (this._status !== 'playing') return;
       const result = updateProjectile(this.level, projectile, dtSeconds);
-      if (result.expired) {
-        if (result.hitTile) this.emitImpactSparks(projectile);
+      if (!result.expired) {
+        if (projectile.owner === 'player') {
+          this.resolvePlayerShot(projectile);
+        } else {
+          // Erasing shots (NULL) delete player shots they touch — absence eats
+          // light. Otherwise enemy bolts hurt AURORA as usual.
+          if (projectile.eraser && this.erasePlayerShots(projectile)) continue;
+          if (projectileOverlaps(projectile, playerBox(this.player))) {
+            deactivateProjectile(projectile);
+            this.emitImpactSparks(projectile);
+            this.damagePlayer();
+          }
+        }
         continue;
       }
 
-      if (projectile.owner === 'player') {
-        this.resolvePlayerShot(projectile);
-      } else {
-        // Erasing shots (NULL) delete player shots they touch — absence eats
-        // light. Otherwise enemy bolts hurt AURORA as usual.
-        if (projectile.eraser && this.erasePlayerShots(projectile)) continue;
-        if (projectileOverlaps(projectile, playerBox(this.player))) {
-          deactivateProjectile(projectile);
-          this.emitImpactSparks(projectile);
-          this.damagePlayer();
-        }
-      }
+      // Died to tiles/bounds/lifetime — still detonate or split first.
+      if (result.hitTile) this.emitImpactSparks(projectile);
+      this.resolveProjectileDeath(projectile, /* hitEnemy */ false);
     }
   }
 
@@ -613,26 +731,32 @@ export class GameSession {
     return erased;
   }
 
+  /**
+   * Player-shot vs enemies: pierce passes through (de-duplicated per enemy),
+   * explosions and splits trigger when the shot finally stops.
+   */
   private resolvePlayerShot(projectile: Projectile): void {
     for (const enemy of this.enemies) {
       if (!enemy.active) continue;
       if (!projectileOverlaps(projectile, enemyBox(enemy))) continue;
+      if (projectile.hitEnemies.includes(enemy.id)) continue;
 
-      deactivateProjectile(projectile);
-      this.emitImpactSparks(projectile);
-      const destroyed = damageEnemy(enemy, projectile.damage);
-      if (!destroyed) {
-        this.hooks.sfx?.('combo-tick', { step: 1 }); // hit-confirm blip
+      projectile.hitEnemies.push(enemy.id);
+      this.applyDamageToEnemy(enemy, projectile.damage);
+
+      if (projectile.explosionRadiusPx > 0) {
+        this.explodeProjectile(projectile, enemy);
+        deactivateProjectile(projectile);
         return;
       }
 
-      // Kill: score with combo + fragment burst.
-      const baseScore = ENEMIES[enemy.kind]?.killScore ?? 50;
-      this.score.award(baseScore, this._timeMs, { kind: 'kill' });
-      this._killsThisSession += 1;
-      this.emitDeathBurst(enemy);
-      this.hooks.sfx?.('pickup');
-      this.hooks.onEvent?.({ type: 'enemy-killed', kind: enemy.kind });
+      if (projectile.pierceLeft > 0) {
+        projectile.pierceLeft -= 1;
+        continue;
+      }
+
+      this.resolveProjectileDeath(projectile, /* hitEnemy */ true);
+      deactivateProjectile(projectile);
       return;
     }
 
@@ -665,6 +789,113 @@ export class GameSession {
         this.hooks.sfx?.('combo-tick', { step: 1 });
       }
     }
+  }
+
+  /**
+   * Death effects for a dying player shot: Nova blasts an area (skipping
+   * enemies the shot already damaged), Fragment scatters its shards. Enemy
+   * shots and plain weapons do nothing.
+   */
+  private resolveProjectileDeath(projectile: Projectile, hitEnemy: boolean): void {
+    void hitEnemy;
+    if (projectile.owner !== 'player') return;
+    if (projectile.explosionRadiusPx > 0) {
+      this.explodeProjectile(projectile, null);
+      return;
+    }
+    if (projectile.splitChildrenLeft > 0) {
+      this.spawnSplitChildren(projectile);
+    }
+  }
+
+  /** Area damage around a dying Nova blast + juice event for shake/flash. */
+  private explodeProjectile(projectile: Projectile, directHit: Enemy | null): void {
+    const center = projectileCenter(projectile);
+    const radius = projectile.explosionRadiusPx;
+
+    for (const enemy of this.enemies) {
+      if (!enemy.active || enemy === directHit) continue;
+      if (projectile.hitEnemies.includes(enemy.id)) continue;
+      const ec = enemyCenter(enemy);
+      if (Math.hypot(ec.x - center.x, ec.y - center.y) > radius) continue;
+      projectile.hitEnemies.push(enemy.id);
+      this.applyDamageToEnemy(enemy, projectile.damage);
+    }
+
+    this.particles.emit({
+      x: center.x,
+      y: center.y,
+      count: 26,
+      speedMin: 80,
+      speedMax: radius * 3.4,
+      lifeSeconds: 0.5,
+      sizePx: 6,
+      gravityScale: 0.25,
+      color: projectile.color,
+    });
+    this.hooks.sfx?.('shoot');
+    this.hooks.onEvent?.({
+      type: 'explosion',
+      x: center.x,
+      y: center.y,
+      radiusPx: radius,
+    });
+  }
+
+  /** Fragment crystals burst into a forward fan of shards on death. */
+  private spawnSplitChildren(parent: Projectile): void {
+    const count = parent.splitChildrenLeft;
+    if (count <= 0) return;
+
+    // Snapshot everything BEFORE spawning: the pool may reuse the parent's
+    // own slot for the first child, wiping its fields mid-burst.
+    const speed = Math.hypot(parent.velocity.x, parent.velocity.y);
+    const forward =
+      speed > 1
+        ? { x: parent.velocity.x / speed, y: parent.velocity.y / speed }
+        : { x: 1, y: 0 };
+    const spec: SplitChildSpec = {
+      owner: parent.owner,
+      color: parent.color,
+      damage: parent.splitChildDamage,
+      lifetimeSeconds: parent.splitChildLifetimeSeconds,
+      speedPxPerS: parent.splitChildSpeedPxPerS,
+    };
+    const origin = projectileCenter(parent);
+    const fanAngleDeg = parent.splitFanAngleDeg;
+    parent.splitChildrenLeft = 0;
+
+    for (const dir of spreadDirections(forward, count, fanAngleDeg)) {
+      launchSplitChild(this.projectiles.spawn(), spec, origin, dir);
+    }
+
+    this.particles.emit({
+      x: origin.x,
+      y: origin.y,
+      count: 8,
+      speedMin: 30,
+      speedMax: 160,
+      lifeSeconds: 0.3,
+      sizePx: 3,
+      color: spec.color,
+    });
+  }
+
+  /** Shared damage/kill resolution so shots and blasts score identically. */
+  private applyDamageToEnemy(enemy: Enemy, amount: number): void {
+    const destroyed = damageEnemy(enemy, amount);
+    if (!destroyed) {
+      this.hooks.sfx?.('combo-tick', { step: 1 }); // hit-confirm blip
+      return;
+    }
+
+    // Kill: score with combo + fragment burst.
+    const baseScore = ENEMIES[enemy.kind]?.killScore ?? 50;
+    this.score.award(baseScore, this._timeMs, { kind: 'kill' });
+    this._killsThisSession += 1;
+    this.emitDeathBurst(enemy);
+    this.hooks.sfx?.('pickup');
+    this.hooks.onEvent?.({ type: 'enemy-killed', kind: enemy.kind });
   }
 
   // ------------------------------------------------------------- pickups --
@@ -893,6 +1124,7 @@ export class GameSession {
   // ----------------------------------------------------------- particles --
 
   private emitImpactSparks(projectile: Projectile): void {
+    const color: WeaponColor = projectile.owner === 'player' ? projectile.color : [1, 0.3, 0.3, 1];
     this.particles.emit({
       x: projectile.position.x + projectile.size.x / 2,
       y: projectile.position.y + projectile.size.y / 2,
@@ -901,7 +1133,7 @@ export class GameSession {
       speedMax: 120,
       lifeSeconds: 0.25,
       sizePx: 3,
-      color: projectile.owner === 'player' ? [0.5, 1, 1, 1] : [1, 0.3, 0.3, 1],
+      color,
     });
   }
 

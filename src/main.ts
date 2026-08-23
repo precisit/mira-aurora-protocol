@@ -13,7 +13,10 @@ import {
   type SpriteDraw,
 } from './renderer/WebGPURenderer';
 import { DomHud } from './ui/Hud';
+import { IntroSequence } from './ui/IntroSequence';
 import { SaveStore } from './save/SaveStore';
+import { newlyUnlockedWeapons } from './save/unlocks';
+import { WEAPONS } from './game/weapons';
 import type { SfxName } from './audio/SfxSynth';
 import { CHECKPOINT_BONUS } from './game/score';
 import { GameSession, type GameEvent } from './game/GameSession';
@@ -38,6 +41,10 @@ import './style.css';
  * PLAYING … → WIN → MENU. Camera follows AURORA; HUD shows score/lives/
  * weapon/combo plus the B5 level/total clocks and the B1 juice telemetry;
  * procedural SFX fire on gameplay events.
+ *
+ * On first boot the skippable B4 intro cinematic plays during BOOT before
+ * MENU (once per page session; any key/tap skips straight to the menu and
+ * the HUD stays hidden until gameplay begins).
  *
  * B1 juice (PLAN.md §4 "Juice & effekter") routes through {@link JuiceSystem},
  * the shared effects façade: jump/land/shoot are observed from the player
@@ -104,18 +111,45 @@ async function boot(): Promise<void> {
   const detachTouchUi = setupTouchControls(input);
 
   const save = new SaveStore();
+  // B3: single live SaveData blob — total score banks at level end and the
+  // unlock watcher below grants weapons the moment the (projected) total
+  // crosses a threshold. Unlocks only ever get added, never revoked.
+  let saveData = save.load();
+  save.save(saveData);
   const audio = new AudioEngine();
-  audio.applySettings(save.load().settings);
-  const detachAudioUnlock = audio.initOnInteraction(window, () => audio.playSfx('ui-click'));
-
+  audio.applySettings(saveData.settings); // persisted volumes (SaveStore hook)
+  const detachAudioUnlock = audio.initOnInteraction(window, () => {
+    // First user interaction unlocks WebAudio; greet with the intro sting
+    // while the cinematic is still running, otherwise the usual UI click.
+    const inIntro = intro !== null && !intro.playback.finished;
+    audio.playSfx(inIntro ? 'intro-sting' : 'ui-click');
+  });
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
+  const hudRoot = document.getElementById('hud-root');
   const state = new GameStateMachine();
   // Task B5: level + total run clocks, kept in sync with the state machine
   // (MENU→PLAYING starts the run, PAUSED pauses, GAMEOVER restarts the level
   // clock while total keeps accumulating — speedrun rules per PLAN.md §4).
   const timer = new LevelTimer();
   const detachTimerSync = attachLevelTimer(state, timer);
-  state.transition(GameStateName.Menu);
+
+  // ---- B4 intro (skippable, once per page session) ------------------------
+  let intro: IntroSequence | null = null;
+  if (IntroSequence.shouldPlay()) {
+    IntroSequence.markPlayed();
+    intro = new IntroSequence(renderer, {
+      parallax,
+      onFinish: () => {
+        input.endFrame(); // the skip keypress must not also start the game
+        if (state.current === GameStateName.Boot) state.transition(GameStateName.Menu);
+      },
+    });
+    intro.start();
+    intro.attach(window); // any key / tap / click skips
+    audio.playSfx('intro-sting'); // silent until audio unlocks; guarded
+  } else {
+    state.transition(GameStateName.Menu); // assets are ready → show menu
+  }
 
   // ---- B1 juice -------------------------------------------------------------
   const juice = new JuiceSystem({
@@ -145,6 +179,8 @@ async function boot(): Promise<void> {
   let toast: Toast | null = null;
   /** Set when the current level finished; consumed by the progression step. */
   let levelFinished = false;
+  /** Highest total score (banked + in-run) we've already granted unlocks for. */
+  let unlockWatermark = saveData.totalScore;
 
   const sfxSink = (name: SfxName, options?: { step?: number }): void => {
     audio.playSfx(name, options);
@@ -161,6 +197,7 @@ async function boot(): Promise<void> {
       levelData: data,
       hooks: { sfx: sfxSink, onEvent: handleGameEvent },
       seed: 0xa7001 + index * 7919,
+      unlockedWeapons: saveData.unlockedWeapons,
     });
     if (carriedDoubleJump) session.player.abilities.doubleJumpUnlocked = true;
     levelFinished = false;
@@ -192,6 +229,10 @@ async function boot(): Promise<void> {
           break;
         case 'powerup-collected':
           juice.bloom.pulse(0.3);
+          break;
+        case 'explosion':
+          // Nova blast: heavy shake + flash + ember burst at the impact point.
+          juice.explosion(event.x, event.y);
           break;
         case 'unlock-granted':
           juice.bloom.pulse(0.55);
@@ -245,6 +286,27 @@ async function boot(): Promise<void> {
       default:
         break;
     }
+  }
+
+  // ---- B3 weapon unlock watcher ---------------------------------------------
+  // Total score = banked save total + current attempt score. The moment the
+  // projected total crosses a threshold the weapon is granted, persisted and
+  // toasted. `unlockWatermark` keeps this monotonic: attempt-score resets
+  // (pre-checkpoint deaths) can never re-grant or revoke anything.
+  function checkWeaponUnlocks(totalScore: number): void {
+    if (totalScore <= unlockWatermark) return;
+    const fresh = newlyUnlockedWeapons(unlockWatermark, totalScore);
+    unlockWatermark = Math.max(unlockWatermark, totalScore);
+    if (!fresh.length) return;
+
+    for (const weaponId of fresh) {
+      save.unlockWeapon(saveData, weaponId);
+      showToast(`NEW WEAPON: ${WEAPONS[weaponId as keyof typeof WEAPONS].name}`, 3400);
+      audio.playSfx('checkpoint');
+      juice.bloom.pulse(0.55);
+    }
+    save.save(audio.captureVolumesInto(saveData));
+    session?.setUnlockedWeapons(saveData.unlockedWeapons);
   }
 
   /** Level data for 1-based index, or undefined past the built campaign. */
@@ -356,8 +418,12 @@ async function boot(): Promise<void> {
     if (!session || !levelFinished) return;
 
     const data = session.level.data;
-    const saveData = save.load();
+    saveData = save.load();
     save.recordLevelResult(saveData, data.id, session.score.score, session.timeMs);
+    // Bank the attempt into total score; any threshold crossed here is
+    // granted + toasted by the same watcher used mid-run.
+    checkWeaponUnlocks(saveData.totalScore);
+    unlockWatermark = Math.max(unlockWatermark, saveData.totalScore);
     save.save(audio.captureVolumesInto(saveData));
 
     // Advance to the next built slot, skipping unbuilt campaign levels
@@ -373,11 +439,10 @@ async function boot(): Promise<void> {
       state.transition(GameStateName.Win);
       audio.stopMusic();
       // Task B5: bank the speedrun total (fastest complete campaign run wins).
-      const runSaveData = save.load();
-      const isNewBestRun = save.recordRunTime(runSaveData, timer.totalElapsedMs);
-      save.save(audio.captureVolumesInto(runSaveData));
+      const isNewBestRun = save.recordRunTime(saveData, timer.totalElapsedMs);
+      save.save(audio.captureVolumesInto(saveData));
       showToast(
-        `ARCHIVE RESTORED — TOTAL ${runSaveData.totalScore}` +
+        `ARCHIVE RESTORED — TOTAL ${saveData.totalScore}` +
           (isNewBestRun ? ' · NEW BEST RUN TIME!' : ''),
         6000,
       );
@@ -387,6 +452,16 @@ async function boot(): Promise<void> {
   // ---- Fixed-timestep loop --------------------------------------------------
   const loop = new GameLoop({
     update(stepMs) {
+      // Intro owns BOOT: advance it, and swallow the frame that ends it so a
+      // skip keypress never leaks into the menu's "press SPACE to start".
+      if (intro && state.current === GameStateName.Boot) {
+        intro.update(stepMs / 1000);
+        if (intro.playback.finished) {
+          input.endFrame();
+          return;
+        }
+      }
+
       // Clocks only accumulate while PLAYING (timer guards internally).
       timer.advance(stepMs);
 
@@ -429,8 +504,14 @@ async function boot(): Promise<void> {
             break;
           }
           if (takeLatch('swap')) {
-            audio.playSfx('weapon-switch');
-            showToast('PULS equipped — more weapons unlock via total score');
+            // B3: cycle unlocked weapons only; the session plays the
+            // weapon-switch sfx when a swap actually happened.
+            const swapped = session?.cycleWeapon(1) ?? false;
+            showToast(
+              swapped && session
+                ? `${session.weapon.name} — ${session.weapon.blurb}`
+                : 'MORE WEAPONS UNLOCK VIA TOTAL SCORE',
+            );
           }
           break;
 
@@ -447,6 +528,8 @@ async function boot(): Promise<void> {
         } else {
           session.update(stepMs, buildPlayerInput());
           applyGameplayJuice();
+          // B3: mid-run unlock check (banked total + live attempt score).
+          checkWeaponUnlocks(saveData.totalScore + session.score.score);
         }
       }
 
@@ -459,6 +542,17 @@ async function boot(): Promise<void> {
 
     render() {
       refreshLatches();
+
+      // B4 intro owns BOOT: draw the cinematic over black and keep the HUD
+      // hidden until the menu/gameplay UI takes over.
+      const introActive = state.current === GameStateName.Boot && intro !== null;
+      if (introActive) {
+        renderer.beginFrame([0, 0, 0, 1]);
+        (intro as IntroSequence).render();
+        renderer.endFrame();
+        if (hudRoot) hudRoot.style.display = 'none';
+        return;
+      }
 
       // B1 screen shake rides the camera transform: everything world-space
       // (parallax pan + tiles/entities) shifts by the trauma noise; the DOM
@@ -479,6 +573,7 @@ async function boot(): Promise<void> {
       drawScreenFlash();
       renderer.endFrame();
 
+      if (hudRoot) hudRoot.style.display = '';
       hud.update({
         gameStateName: state.current,
         levelName: session?.level.data.name ?? '—',
@@ -487,7 +582,7 @@ async function boot(): Promise<void> {
         message: currentMessage(),
         score: session?.score.score,
         lives: session?.lives,
-        weapon: session ? 'PULS' : undefined,
+        weapon: session?.weapon.name,
         comboMultiplier: session?.score.multiplier,
         timeSeconds: session ? session.timeMs / 1000 : undefined,
         timeText: timer.formatLevelTime(),
@@ -523,6 +618,7 @@ async function boot(): Promise<void> {
     detachTouchUi();
     detachAudioUnlock();
     detachTimerSync();
+    intro?.dispose();
     audio.dispose();
     hud.destroy();
   });
@@ -913,6 +1009,7 @@ function setupTouchControls(input: InputManager): () => void {
     <div class="touch-group touch-right">
       <button class="touch-btn" data-action="shoot" aria-label="Shoot">FIRE</button>
       <button class="touch-btn" data-action="jump" aria-label="Jump">JUMP</button>
+      <button class="touch-btn" data-action="swap" aria-label="Swap weapon">WPN</button>
     </div>
   `;
   document.body.appendChild(container);
@@ -930,7 +1027,9 @@ function setupTouchControls(input: InputManager): () => void {
             ? InputAction.Jump
             : action === 'shoot'
               ? InputAction.Shoot
-              : null;
+              : action === 'swap'
+                ? InputAction.SwapWeapon
+                : null;
     if (!mapped) continue;
     element.classList.add('no-select');
     detachers.push(input.bindTouchButton(element, mapped));
