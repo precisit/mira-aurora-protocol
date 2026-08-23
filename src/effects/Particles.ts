@@ -11,6 +11,11 @@ import type { Rgba, SpriteDraw } from '../renderer/types';
  * which keeps GC pressure off the 120 Hz fixed-timestep loop (PLAN.md §6
  * "Objektpooling").
  *
+ * buildDraws() returns a truncation-safe *view* over the preallocated draw
+ * records: shrinking the view never drops pooled quads (mirrors
+ * game/ParticleSystem.ts), so a small frame can never leave `draws[n]`
+ * undefined on a later bigger one.
+ *
  * Rendering integrates through SpriteBatch: each live particle becomes one
  * `SpriteDraw` quad; glow particles use `'additive'` blending so they light
  * up the frame and feed the bloom post-pass.
@@ -126,7 +131,13 @@ export class ParticleSystem {
   private readonly pool: Particle[];
   private alive = 0;
   private recycleCursor = 0;
+  /** Pooled draw records — never truncated, stable identities for the lifetime. */
   private readonly draws: SpriteDraw[];
+  /**
+   * Truncation-safe alias of {@link draws} handed to callers each frame.
+   * Shrinking this must never drop pooled records (see buildDraws).
+   */
+  private readonly drawView: SpriteDraw[];
   private readonly drawTints: Array<[number, number, number, number]>;
   private readonly drawGlows: Array<[number, number, number, number]>;
   /** Reused by burst() so per-particle emission never allocates. */
@@ -140,6 +151,7 @@ export class ParticleSystem {
     const cap = Math.max(1, Math.floor(capacity));
     this.pool = new Array<Particle>(cap);
     this.draws = new Array<SpriteDraw>(cap);
+    this.drawView = new Array<SpriteDraw>(cap);
     this.drawTints = new Array<[number, number, number, number]>(cap);
     this.drawGlows = new Array<[number, number, number, number]>(cap);
     for (let i = 0; i < cap; i++) {
@@ -161,6 +173,7 @@ export class ParticleSystem {
         blend: 'additive',
         glow: undefined,
       };
+      this.drawView[i] = this.draws[i]!;
     }
   }
 
@@ -294,9 +307,31 @@ export class ParticleSystem {
    * it. The returned array identity is stable for the lifetime of the system
    * (only contents change), so callers may pass it straight to
    * `renderer.drawSprites('white', …)` every frame without allocating.
+   *
+   * Only the returned *view* is truncated to the alive count — the pooled
+   * records in {@link draws} keep their full capacity, so a small frame can
+   * never leave `draws[n]` undefined on a later bigger one (regression:
+   * "Cannot set properties of undefined (setting x)").
    */
   public buildDraws(): readonly SpriteDraw[] {
     const draws = this.draws;
+    const view = this.drawView;
+    const cap = this.capacity;
+
+    // Restore any slots lost to truncation so a pooled quad exists for every
+    // index below capacity. Steady state: draws.length === cap → the loop
+    // body never runs → zero allocations after warmup.
+    for (let i = draws.length; i < cap; i++) {
+      const record: SpriteDraw = {
+        x: 0, y: 0, width: 0, height: 0,
+        tint: this.drawTints[i]!,
+        blend: 'additive',
+        glow: undefined,
+      };
+      draws[i] = record;
+      view[i] = record;
+    }
+
     let n = 0;
     for (let i = 0; i < this.alive; i++) {
       const p = this.pool[i]!;
@@ -329,10 +364,11 @@ export class ParticleSystem {
       } else {
         d.glow = undefined;
       }
+      view[n] = d;
       n += 1;
     }
-    draws.length = n;
-    return draws;
+    view.length = n; // truncate the view, never the pooled records
+    return view;
   }
 
   // ------------------------------------------------------- scene presets --

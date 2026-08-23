@@ -5,7 +5,8 @@
  *   - Procedural SFX synthesis (see {@link ./SfxSynth}) routed through a
  *     dedicated SFX bus (sfxGain → masterGain → destination).
  *   - Per-level looping mp3 music (see {@link ./MusicPlayer}); the mp3 files
- *     arrive in Fas 5, until then track lookups warn once and stay silent.
+ *     arrive in Fas 5, until then track lookups note once (info level) and
+ *     stay silent.
  *
  * Autoplay policy: the AudioContext is created lazily inside {@link unlock},
  * which must run from a user gesture — {@link initOnInteraction} wires that
@@ -45,11 +46,14 @@ export interface AudioEngineOptions {
   resolveTrackUrl?: TrackUrlResolver;
   /** Warning sink; defaults to console.warn. */
   onError?: (message: string) => void;
+  /** Info sink for expected/phase-related notices; defaults to console.info. */
+  onInfo?: (message: string) => void;
 }
 
 export class AudioEngine {
   private readonly createContext: AudioContextFactory;
   private readonly errorSink: (message: string) => void;
+  private readonly infoSink: (message: string) => void;
 
   private readonly music: MusicPlayer;
 
@@ -69,11 +73,13 @@ export class AudioEngine {
       ((message: string) => {
         console.warn(message);
       });
+    this.infoSink = options.onInfo ?? ((message: string) => console.info(message));
 
     this.music = new MusicPlayer({
       createElement: options.createMediaElement,
       resolveTrackUrl: options.resolveTrackUrl,
       onError: (message) => this.reportError(message),
+      onInfo: (message) => this.reportInfo(message),
     });
     this.syncMusicVolume();
   }
@@ -280,6 +286,10 @@ export class AudioEngine {
     try {
       await ctx.resume();
     } catch (error) {
+      // Autoplay policy blocks resume() until the first user gesture — an
+      // expected, by-design state (unlock-on-first-gesture retries later), so
+      // it must stay silent rather than spamming the QA console.
+      if (isAutoplayBlock(error)) return;
       this.reportError(`[audio] could not resume audio context: ${String(error)}`);
     }
   }
@@ -287,6 +297,23 @@ export class AudioEngine {
   private reportError(message: string): void {
     this.errorSink(message);
   }
+
+  private reportInfo(message: string): void {
+    this.infoSink(message);
+  }
+}
+
+/**
+ * True when a resume() failure is just the browser autoplay policy refusing
+ * to start audio before a user gesture. Chrome rejects with a DOMException
+ * named NotAllowedError ("The AudioContext was not allowed to start.");
+ * message matching keeps the check portable for non-DOM environments.
+ */
+function isAutoplayBlock(error: unknown): boolean {
+  const name = (error as { name?: unknown } | null)?.name;
+  if (typeof name === 'string' && name === 'NotAllowedError') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /not allowed|autoplay/i.test(message);
 }
 
 // ---------------------------------------------------------------------------

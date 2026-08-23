@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ParticleSystem } from '../src/effects/Particles';
+import type { SpriteDraw } from '../src/renderer/types';
 
 /** Fixed step matching the game loop (120 Hz). */
 const STEP = 1 / 120;
@@ -46,6 +47,65 @@ describe('ParticleSystem pool reuse (no allocation after warmup)', () => {
     const emitted = ps.burst({ count: 100, x: 0, y: 0, life: 5 });
     expect(emitted).toBe(100); // burst reports requested count
     expect(ps.aliveCount).toBe(16); // but the pool stays capped
+  });
+});
+
+describe('ParticleSystem buildDraws truncation regression (QA console crash)', () => {
+  /**
+   * Regression: buildDraws() used to truncate its pooled backing array to the
+   * alive count. A later frame with more particles than the truncated length
+   * hit `draws[n] === undefined` and threw
+   * "Cannot set properties of undefined (setting x)" — hard-blocking gameplay.
+   */
+  it('survives a burst bigger than a previous (smaller) buildDraws frame', () => {
+    const ps = new ParticleSystem(32);
+    ps.burst({ count: 5, x: 0, y: 0, life: 5, speed: 0 });
+
+    let draws: readonly SpriteDraw[] = [];
+    expect(() => (draws = ps.buildDraws())).not.toThrow();
+    expect(draws.length).toBe(5);
+
+    ps.burst({ count: 20, x: 0, y: 0, life: 5, speed: 0 }); // 25 alive > 5 slots
+    expect(() => (draws = ps.buildDraws())).not.toThrow(); // used to throw here
+    expect(ps.aliveCount).toBe(25);
+    expect(draws.length).toBe(ps.aliveCount); // exactly one quad per particle
+  });
+
+  it('keeps stable view identity and pooled records across mixed update/buildDraws cycles', () => {
+    const ps = new ParticleSystem(32);
+    const seenRecords = new Set<SpriteDraw>();
+    let previousView: readonly SpriteDraw[] | null = null;
+
+    ps.burst({ count: 32, x: 0, y: 0, life: 0.2 });
+    for (let frame = 0; frame < 40; frame++) {
+      let draws: readonly SpriteDraw[] = [];
+      expect(() => (draws = ps.buildDraws())).not.toThrow();
+
+      if (previousView !== null) expect(draws).toBe(previousView); // stable identity
+      for (const d of draws) {
+        expect(d).toBeDefined(); // never undefined after shrink→grow frames
+        expect(Number.isFinite(d.x + d.y)).toBe(true);
+        seenRecords.add(d);
+      }
+      previousView = draws;
+
+      ps.update(STEP);
+      if (!ps.isEmpty) ps.burst({ count: 3, x: 10, y: 10 }); // refill mid-cycle
+    }
+
+    // Records are pooled objects reused across frames, not fresh allocations.
+    expect(seenRecords.size).toBeGreaterThan(0);
+    expect(seenRecords.size).toBeLessThanOrEqual(32);
+  });
+
+  it('returns exactly the alive count every cycle even when counts fluctuate', () => {
+    const ps = new ParticleSystem(32);
+    const pattern = [1, 30, 2, 17, 32, 0, 8];
+    for (const count of pattern) {
+      if (count > 0) ps.burst({ count, x: 0, y: 0, life: 5, speed: 0 });
+      else for (let i = 60; i > 0; i--) ps.update(1); // drain everything
+      expect(ps.buildDraws().length).toBe(ps.aliveCount);
+    }
   });
 });
 
