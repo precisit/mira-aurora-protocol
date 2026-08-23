@@ -47,6 +47,19 @@ export function nextWeaponUnlock(totalScore: number): WeaponUnlockThreshold | nu
 }
 
 /**
+ * Weapons whose thresholds were crossed between two total-score readings,
+ * in threshold order. Used by the live unlock watcher (B3): feed it the
+ * previous best-known total and the current one; empty result = nothing new.
+ * A decreasing score (attempt resets) simply yields [] — unlocks never go
+ * backwards.
+ */
+export function newlyUnlockedWeapons(beforeTotal: number, afterTotal: number): string[] {
+  return WEAPON_UNLOCK_THRESHOLDS.filter(
+    (w) => beforeTotal < w.requiredTotalScore && afterTotal >= w.requiredTotalScore,
+  ).map((w) => w.weaponId);
+}
+
+/**
  * Grants every weapon `data.totalScore` has earned but that is missing from
  * `unlockedWeapons` (additive, idempotent, never revokes). Returns true when
  * anything changed — callers can persist and toast "new weapon!" then.
