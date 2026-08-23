@@ -5,6 +5,7 @@ import type {
   PowerupTypeName,
 } from '../game/entities';
 import { FRAGMENT_ORDER } from '../game/entities';
+import type { BossId } from '../game/bosses';
 
 /**
  * Tilemap level format (task A2, PLAN.md §6): tilemap-based levels with
@@ -43,7 +44,13 @@ export type LevelSpawn =
   | { kind: 'unlock'; unlock: AbilityUnlockName; tx: number; ty: number }
   | { kind: 'powerup'; powerup: PowerupTypeName; tx: number; ty: number }
   | { kind: 'enemy'; enemy: EnemyTypeName; tx: number; ty: number }
-  | { kind: 'fragment'; fragment: FragmentTypeName; tx: number; ty: number };
+  | { kind: 'fragment'; fragment: FragmentTypeName; tx: number; ty: number }
+  /**
+   * Boss room (task B2): inclusive tile rect of the arena. GameSession arms
+   * the encounter when AURORA steps inside — the boss spawns, the camera
+   * locks to these bounds and the exit stays sealed until the boss falls.
+   */
+  | { kind: 'boss'; boss: BossId; tx0: number; ty0: number; tx1: number; ty1: number };
 
 // ---------------------------------------------------------------- metadata --
 

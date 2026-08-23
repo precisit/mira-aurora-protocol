@@ -104,6 +104,7 @@ describe('A2: all levels parse and pass static validation', () => {
 
     it(`"${data.name}" keeps every spawn inside bounds on a free tile`, () => {
       for (const s of data.spawns) {
+        if (s.kind === 'boss') continue; // tile-rect arena, checked in bosses tests
         expect(s.tx).toBeGreaterThanOrEqual(0);
         expect(s.tx).toBeLessThan(data.widthTiles);
         expect(s.ty).toBeGreaterThanOrEqual(0);

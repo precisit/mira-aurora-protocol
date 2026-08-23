@@ -70,6 +70,8 @@ export function validateLevelData(data: LevelData): string[] {
   }
 
   for (const spawn of data.spawns) {
+    // Boss arenas are tile rects with their own checks below.
+    if (spawn.kind === 'boss') continue;
     const label = `${spawn.kind}@(${spawn.tx},${spawn.ty})`;
     if (!inBounds(data, spawn.tx, spawn.ty)) {
       issues.push(`${where}: spawn ${label} out of bounds`);
@@ -88,6 +90,38 @@ export function validateLevelData(data: LevelData): string[] {
     }
   }
 
+  // --- boss arenas (task B2): at most one, sane rect, open interior ---------
+  const arenas = data.spawns.filter((s): s is Extract<LevelSpawn, { kind: 'boss' }> => s.kind === 'boss');
+  if (arenas.length > 1) issues.push(`${where}: more than one boss arena`);
+  for (const arena of arenas) {
+    const label = `boss arena "${arena.boss}"`;
+    const cornersInBounds =
+      inBounds(data, arena.tx0, arena.ty0) &&
+      inBounds(data, arena.tx1, arena.ty1) &&
+      arena.tx1 >= arena.tx0 &&
+      arena.ty1 >= arena.ty0;
+    if (!cornersInBounds) {
+      issues.push(`${where}: ${label} rect out of bounds or inverted`);
+      continue;
+    }
+    const widthTiles = arena.tx1 - arena.tx0 + 1;
+    const heightTiles = arena.ty1 - arena.ty0 + 1;
+    if (widthTiles < MIN_ARENA_TILES || heightTiles < MIN_ARENA_TILES) {
+      issues.push(
+        `${where}: ${label} is ${widthTiles}×${heightTiles} tiles, needs ≥${MIN_ARENA_TILES} per side`,
+      );
+    }
+    let solidTiles = 0;
+    for (let ty = arena.ty0; ty <= arena.ty1; ty++) {
+      for (let tx = arena.tx0; tx <= arena.tx1; tx++) {
+        if (tileAt(data, tx, ty) === TileType.Solid) solidTiles += 1;
+      }
+    }
+    if (solidTiles > 0) {
+      issues.push(`${where}: ${label} contains ${solidTiles} solid tiles (keep the fight open)`);
+    }
+  }
+
   // Checkpoints must lie ahead of the spawn and be ordered left→right.
   const spawnEntry = data.spawns.find((s) => s.kind === 'playerSpawn');
   const checkpointXs = checkpoints.map((c) => c.tx).sort((a, b) => a - b);
@@ -99,3 +133,6 @@ export function validateLevelData(data: LevelData): string[] {
 
   return issues;
 }
+
+/** Smallest allowed arena side, in tiles (a fight needs room to dodge). */
+const MIN_ARENA_TILES = 12;

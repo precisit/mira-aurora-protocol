@@ -62,6 +62,21 @@ body {
   color: var(--neon-cyan);
 }
 
+/* Boss HP bar (task B2). */
+.hud-boss {
+  color: var(--neon-pink);
+}
+
+.hud-boss-bar {
+  color: var(--neon-pink);
+  letter-spacing: -0.12em;
+  text-shadow: 0 0 8px rgba(255, 47, 214, 0.9);
+}
+
+.hud-boss-phase {
+  color: rgba(191, 239, 255, 0.7);
+}
+
 /* ---- Touch controls (B0: multi-touch virtual buttons) ------------------ */
 
 .touch-ui {

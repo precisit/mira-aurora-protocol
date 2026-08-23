@@ -4,7 +4,6 @@ import { attachLevelTimer, LevelTimer } from './core/Timer';
 import { AudioEngine } from './audio/AudioEngine';
 import { JuiceSystem } from './effects/JuiceSystem';
 import { InputAction, InputManager } from './input/InputManager';
-import { CAMPAIGN_LEVELS } from './levels/levels';
 import { Level } from './levels/Level';
 import { TILE_SIZE, TileType } from './levels/LevelData';
 import { ParallaxBackground } from './renderer/ParallaxBackground';
@@ -22,7 +21,10 @@ import type { SfxName } from './audio/SfxSynth';
 import { CHECKPOINT_BONUS } from './game/score';
 import { GameSession, type GameEvent } from './game/GameSession';
 import { emptyPlayerInput, type PlayerInput } from './game/Player';
-import { ENEMY_COLORS_FALLBACK } from './game/renderPalette';
+import { ENEMY_COLORS_FALLBACK, BOSS_COLORS_FALLBACK } from './game/renderPalette';
+import { laserTelegraphBox, type LaserBeam } from './game/bosses';
+import { BOSS_DIALOGUE } from './ui/story';
+import { PLAYABLE_LEVELS } from './levels/levels';
 import type { EnemyTypeName, FragmentTypeName } from './game/entities';
 import { POWERUPS } from './game/entities';
 import type { Particle } from './game/ParticleSystem';
@@ -238,6 +240,15 @@ async function boot(): Promise<void> {
         case 'level-complete':
           juice.bloom.pulse(0.6);
           break;
+        case 'boss-encountered':
+          juice.bossWarning();
+          break;
+        case 'boss-phase-changed':
+          juice.bossWarning();
+          break;
+        case 'boss-defeated':
+          juice.explosion(p.centerX, p.centerY);
+          break;
         default:
           break;
       }
@@ -254,6 +265,21 @@ async function boot(): Promise<void> {
       case 'powerup-collected':
         showToast(POWERUPS[event.powerup]?.blurb ?? event.powerup);
         break;
+      case 'boss-encountered':
+        showToast(`${BOSS_DIALOGUE[event.boss].encounter === '…' ? event.boss : `${event.boss}: “${BOSS_DIALOGUE[event.boss].encounter}”`}`, 4200);
+        break;
+      case 'boss-phase-changed':
+        if (event.quote) showToast(`${event.boss}: “${event.quote}”`, 3800);
+        break;
+      case 'boss-quote':
+        showToast(`${event.boss}: “${event.text}”`, 3200);
+        break;
+      case 'boss-defeated': {
+        const defeat = BOSS_DIALOGUE[event.boss].defeat;
+        const quote = defeat === '…' ? '' : ` “${defeat}”`;
+        showToast(`${event.boss} DEFEATED · +${event.points}${quote}`, 5200);
+        break;
+      }
       case 'level-complete':
         levelFinished = true;
         break;
@@ -285,7 +311,7 @@ async function boot(): Promise<void> {
 
   /** Level data for 1-based index, or undefined past the built campaign. */
   function campaignLevel(index: number) {
-    return CAMPAIGN_LEVELS.find((l) => l.index === index);
+    return PLAYABLE_LEVELS.find((l) => l.index === index);
   }
 
   // ---- B1 continuous juice observers ---------------------------------------
@@ -400,9 +426,13 @@ async function boot(): Promise<void> {
     unlockWatermark = Math.max(unlockWatermark, saveData.totalScore);
     save.save(audio.captureVolumesInto(saveData));
 
-    const nextIndex = levelIndex + 1;
-    if (campaignLevel(nextIndex)) {
-      levelIndex = nextIndex;
+    // Advance to the next built slot, skipping unbuilt campaign levels
+    // (4 and 6 until Fas 3) so the boss arenas are reachable today.
+    const nextLevel = PLAYABLE_LEVELS.filter((l) => l.index > levelIndex).sort(
+      (a, b) => a.index - b.index,
+    )[0];
+    if (nextLevel) {
+      levelIndex = nextLevel.index;
       startLevel(levelIndex);
       showToast(`LEVEL ${levelIndex} — ${session.level.data.name}`, 2600);
     } else {
@@ -536,7 +566,9 @@ async function boot(): Promise<void> {
 
       if (session) {
         renderer.drawSprites('white', buildWorldSprites(renderer, session, panX, offsetY));
+        drawBossOverlays(renderer, session, panX, offsetY);
         renderer.drawSprites('white', juice.particles.buildDraws());
+        drawDarkness(renderer, session);
       }
       drawScreenFlash();
       renderer.endFrame();
@@ -556,6 +588,7 @@ async function boot(): Promise<void> {
         timeText: timer.formatLevelTime(),
         totalTimeText: timer.formatTotalTime(),
         juiceLine: juice.statsLine(),
+        boss: session?.getBossHud() ?? null,
       });
     },
   });
@@ -706,6 +739,60 @@ function buildWorldSprites(
     });
   }
 
+  // --- boss body ---------------------------------------------------------------
+  const boss = session.boss;
+  if (boss && boss.active) {
+    const base = BOSS_COLORS_FALLBACK[boss.bossId] ?? ([1, 1, 1, 1] as Rgba);
+    const box = boss.bodyBox();
+    const flashing = boss.hitFlashMs > 0;
+    const bodyTint: Rgba = flashing ? [1, 1, 1, 1] : base;
+    sprites.push({
+      x: box.x - 6 - panX,
+      y: box.y - 6 - camY,
+      width: box.width + 12,
+      height: box.height + 12,
+      tint: [bodyTint[0], bodyTint[1], bodyTint[2], 0.4],
+      glow: [bodyTint[0], bodyTint[1], bodyTint[2], 2],
+      blend: 'additive',
+    });
+    sprites.push({ x: box.x - panX, y: box.y - camY, width: box.width, height: box.height, tint: bodyTint });
+    // Core eye.
+    sprites.push({
+      x: box.x + box.width / 2 - 7 - panX,
+      y: box.y + box.height / 2 - 7 - camY,
+      width: 14,
+      height: 14,
+      tint: PLAYER_CORE_COLOR,
+      glow: [1, 1, 1, 2.2],
+      blend: 'additive',
+    });
+    // VESSEL's defensive shell reads as a sealed bracket around the body.
+    if (boss.shellClosed) {
+      sprites.push({
+        x: box.x - 14 - panX,
+        y: box.y - 14 - camY,
+        width: box.width + 28,
+        height: box.height + 28,
+        tint: [0.55, 1, 1, 0.85],
+        glow: [0.55, 1, 1, 1.8],
+        blend: 'additive',
+      });
+    }
+    // Phase-transition tell: surging white aura.
+    if (boss.tellGlowMs > 0) {
+      const pulse = 0.35 + 0.3 * Math.sin(session.timeMs / 60);
+      sprites.push({
+        x: box.x - 22 - panX,
+        y: box.y - 22 - camY,
+        width: box.width + 44,
+        height: box.height + 44,
+        tint: [1, 1, 1, pulse],
+        glow: [1, 0.9, 1, 2.5],
+        blend: 'additive',
+      });
+    }
+  }
+
   // --- player (blinks while invulnerable) ---------------------------------------
   const p = session.player;
   const blinkHidden =
@@ -739,15 +826,28 @@ function buildWorldSprites(
   }
 
   // --- projectiles ----------------------------------------------------------------
-  const projectileSprites: SpriteDraw[] = session.activeProjectiles.map((shot: Projectile) => ({
-    x: shot.position.x - panX,
-    y: shot.position.y - camY,
-    width: shot.size.x,
-    height: shot.size.y,
-    tint: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
-    glow: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
-    blend: 'additive',
-  }));
+  const projectileSprites: SpriteDraw[] = session.activeProjectiles.map((shot: Projectile) => {
+    if (shot.eraser) {
+      // Absence shard: a hole in the world, faintly violet-edged.
+      return {
+        x: shot.position.x - 3 - panX,
+        y: shot.position.y - 3 - camY,
+        width: shot.size.x + 6,
+        height: shot.size.y + 6,
+        tint: [0.02, 0.005, 0.05, 1],
+        glow: [0.5, 0.2, 0.9, 1.4],
+      } satisfies SpriteDraw;
+    }
+    return {
+      x: shot.position.x - panX,
+      y: shot.position.y - camY,
+      width: shot.size.x,
+      height: shot.size.y,
+      tint: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
+      glow: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
+      blend: 'additive',
+    };
+  });
   pushAll(sprites, projectileSprites);
 
   // --- particles --------------------------------------------------------------------
@@ -770,7 +870,107 @@ function buildWorldSprites(
 }
 
 function pushAll(target: SpriteDraw[], items: readonly SpriteDraw[]): void {
-  for (const item of items) target.push(item);
+  target.push(...items);
+}
+
+// ---------------------------------------------------------------------------
+// Boss overlays (task B2): laser beams, erasure voids and the darkness wave.
+// Drawn after world sprites so beams/voids read on top of tiles and bodies.
+// ---------------------------------------------------------------------------
+
+const LASER_COLOR: Rgba = [1, 0.35, 0.75, 1];
+const LASER_CORE: Rgba = [1, 0.95, 1, 1];
+const VOID_FILL: Rgba = [0.012, 0.004, 0.03, 0.94];
+const VOID_RIM: Rgba = [0.55, 0.25, 1, 0.5];
+
+function drawBossOverlays(
+  renderer: WebGPURenderer,
+  session: GameSession,
+  panX: number,
+  offsetY: number,
+): void {
+  const boss = session.boss;
+  if (!boss) return;
+  const camY = session.cameraY + offsetY;
+
+  // --- laser beams ---------------------------------------------------------
+  const beamSprites: SpriteDraw[] = [];
+  for (const beam of boss.lasersSnapshot as readonly LaserBeam[]) {
+    const telegraph = laserTelegraphBox(beam);
+    if (telegraph) {
+      const blink = 0.4 + 0.4 * Math.abs(Math.sin(beam.remainingMs / 90));
+      beamSprites.push({
+        x: telegraph.x - panX,
+        y: telegraph.y - camY,
+        width: telegraph.width,
+        height: telegraph.height,
+        tint: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], blink],
+        glow: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 1.6],
+        blend: 'additive',
+      });
+      continue;
+    }
+    const box =
+      beam.mode === 'firing'
+        ? {
+            x: beam.orientation === 'vertical' ? beam.position - beam.thickness / 2 : beam.spanMin,
+            y: beam.orientation === 'vertical' ? beam.spanMin : beam.position - beam.thickness / 2,
+            width: beam.orientation === 'vertical' ? beam.thickness : beam.spanMax - beam.spanMin,
+            height: beam.orientation === 'vertical' ? beam.spanMax - beam.spanMin : beam.thickness,
+          }
+        : null;
+    if (!box) continue;
+    // Outer glow band + white-hot core line.
+    beamSprites.push({
+      x: box.x - 6 - panX,
+      y: box.y - 6 - camY,
+      width: box.width + 12,
+      height: box.height + 12,
+      tint: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 0.55],
+      glow: [LASER_COLOR[0], LASER_COLOR[1], LASER_COLOR[2], 2.4],
+      blend: 'additive',
+    });
+    beamSprites.push({
+      x: box.x - panX,
+      y: box.y - camY,
+      width: box.width,
+      height: box.height,
+      tint: LASER_CORE,
+      glow: [1, 1, 1, 2],
+      blend: 'additive',
+    });
+  }
+  renderer.drawSprites('white', beamSprites);
+
+  // --- NULL's void zones (dark quads with a faint violet rim) ---------------
+  const voidSprites: SpriteDraw[] = [];
+  for (const zone of boss.hazardCircles()) {
+    const d = zone.radiusPx * 2;
+    if (zone.radiusPx <= 1) continue;
+    voidSprites.push(
+      { x: zone.centerX - zone.radiusPx - 3 - panX, y: zone.centerY - zone.radiusPx - 3 - camY,
+        width: d + 6, height: d + 6, tint: VOID_RIM },
+      { x: zone.centerX - zone.radiusPx - panX, y: zone.centerY - zone.radiusPx - camY,
+        width: d, height: d, tint: VOID_FILL },
+    );
+  }
+  renderer.drawSprites('white', voidSprites);
+}
+
+/** Fullscreen darkening while NULL's darkness waves peak. */
+function drawDarkness(renderer: WebGPURenderer, session: GameSession): void {
+  const darkness = session.darknessLevel;
+  if (darkness <= 0.01) return;
+  const bounds = renderer.viewBounds;
+  renderer.drawSprites('white', [
+    {
+      x: bounds.left,
+      y: bounds.top,
+      width: bounds.right - bounds.left,
+      height: bounds.bottom - bounds.top,
+      tint: [0.01, 0, 0.04, Math.min(0.78, darkness * 0.72)],
+    },
+  ]);
 }
 
 function pickupColor(pickup: Pickup): Rgba {

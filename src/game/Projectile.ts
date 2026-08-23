@@ -32,6 +32,11 @@ export interface Projectile extends Entity {
   damage: number;
   /** Remaining lifetime in seconds. */
   lifeSeconds: number;
+  /**
+   * NULL's "absence" shots (task B2): erase other sprites they touch and
+   * render as void shards instead of glowing bolts.
+   */
+  eraser: boolean;
   /** Weapon that fired this shot; null for enemy shots and split children. */
   weaponId: string | null;
   color: WeaponColor;
@@ -61,6 +66,7 @@ export function createProjectile(id: number): Projectile {
     owner: 'player',
     damage: 1,
     lifeSeconds: 0,
+    eraser: false,
     weaponId: null,
     color: ENEMY_SHOT_COLOR,
     pierceLeft: 0,
@@ -184,6 +190,7 @@ export function launchProjectile(
   projectile.owner = owner;
   projectile.damage = Math.max(1, Math.round(damage));
   projectile.lifeSeconds = Math.max(0.05, lifetimeSeconds);
+  projectile.eraser = false;
   resetBehaviorFields(projectile);
   projectile.size.x = PROJECTILE_WIDTH;
   projectile.size.y = PROJECTILE_HEIGHT;
@@ -211,6 +218,7 @@ export function launchWeaponProjectile(
   projectile.owner = 'player';
   projectile.damage = Math.max(1, Math.round(weapon.damage));
   projectile.lifeSeconds = Math.max(0.05, weapon.lifetimeSeconds);
+  projectile.eraser = false;
   projectile.weaponId = weapon.id;
   projectile.color = weapon.color;
   projectile.pierceLeft = weapon.pierceHits;
@@ -255,6 +263,7 @@ export function launchSplitChild(
   projectile.owner = spec.owner;
   projectile.damage = Math.max(1, Math.round(spec.damage));
   projectile.lifeSeconds = Math.max(0.05, spec.lifetimeSeconds);
+  projectile.eraser = false;
   projectile.weaponId = null;
   projectile.color = spec.color;
   projectile.pierceLeft = 0;
@@ -279,6 +288,7 @@ export function launchSplitChild(
 export const SPLIT_CHILD_SIZE_PX = 5;
 
 function resetBehaviorFields(p: Projectile): void {
+  p.eraser = false;
   p.weaponId = null;
   p.color = ENEMY_SHOT_COLOR;
   p.pierceLeft = 0;

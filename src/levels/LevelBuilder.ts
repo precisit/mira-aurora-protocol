@@ -1,3 +1,4 @@
+import type { BossId } from '../game/bosses';
 import type { LevelData, LevelSpawn } from './LevelData';
 import { TileType } from './LevelData';
 
@@ -69,6 +70,14 @@ export class LevelBuilder {
   public spawn(spawn: LevelSpawn): this {
     this.spawns.push(spawn);
     return this;
+  }
+
+  /**
+   * Mark a boss room (task B2): inclusive tile rect the encounter triggers
+   * inside. Keep the rect free of solid tiles so the fight stays open.
+   */
+  public bossArena(boss: BossId, tx0: number, ty0: number, tx1: number, ty1: number): this {
+    return this.spawn({ kind: 'boss', boss, tx0, ty0, tx1, ty1 });
   }
 
   /**
