@@ -10,6 +10,10 @@ export interface HudState {
   levelName: string;
   fps: number;
   cameraX: number;
+  /** Current level clock formatted as mm:ss.xx (task B5); null hides it. */
+  timeText: string | null;
+  /** Total run clock formatted as mm:ss.xx (speedrun total, task B5). */
+  totalTimeText: string | null;
   /** Transient message (menu hints, pause text); null hides it. */
   message: string | null;
 }
@@ -26,7 +30,15 @@ export class DomHud implements Hud {
     this.root = document.createElement('div');
     this.root.className = 'hud';
     host.appendChild(this.root);
-    this.render({ gameStateName: '-', levelName: '-', fps: 0, cameraX: 0, message: null });
+    this.render({
+      gameStateName: '-',
+      levelName: '-',
+      fps: 0,
+      cameraX: 0,
+      timeText: null,
+      totalTimeText: null,
+      message: null,
+    });
   }
 
   public update(state: HudState): void {
@@ -44,6 +56,8 @@ export class DomHud implements Hud {
       `level: ${state.levelName}`,
       `${Math.round(state.fps)} fps`,
     ];
+    if (state.timeText !== null) parts.push(`time: ${state.timeText}`);
+    if (state.totalTimeText !== null) parts.push(`total: ${state.totalTimeText}`);
     let html = `<span class="hud-title">${parts[0]}</span><span>${parts.slice(1).join(' · ')}</span>`;
     if (state.message) html += `<span class="hud-message">${escapeHtml(state.message)}</span>`;
     this.root.innerHTML = html;
