@@ -1,13 +1,14 @@
 import { GameLoop } from './core/GameLoop';
 import { GameStateMachine, GameStateName } from './core/GameState';
+import { attachLevelTimer, LevelTimer } from './core/Timer';
 import { AudioEngine } from './audio/AudioEngine';
+import { JuiceSystem } from './effects/JuiceSystem';
 import { InputAction, InputManager } from './input/InputManager';
-import { getLevel } from './levels/levels';
+import { CAMPAIGN_LEVELS } from './levels/levels';
 import { Level } from './levels/Level';
 import { TILE_SIZE, TileType } from './levels/LevelData';
 import { ParallaxBackground } from './renderer/ParallaxBackground';
 import {
-  VIRTUAL_WIDTH,
   WebGPURenderer,
   type Rgba,
   type SpriteDraw,
@@ -15,37 +16,70 @@ import {
 import { DomHud } from './ui/Hud';
 import { IntroSequence } from './ui/IntroSequence';
 import { SaveStore } from './save/SaveStore';
+import type { SfxName } from './audio/SfxSynth';
+import { CHECKPOINT_BONUS } from './game/score';
+import { GameSession, type GameEvent } from './game/GameSession';
+import { emptyPlayerInput, type PlayerInput } from './game/Player';
+import { ENEMY_COLORS_FALLBACK } from './game/renderPalette';
+import type { EnemyTypeName, FragmentTypeName } from './game/entities';
+import { POWERUPS } from './game/entities';
+import type { Particle } from './game/ParticleSystem';
+import type { Pickup } from './game/pickups';
+import type { Projectile } from './game/Projectile';
 import './style.css';
 
 /**
- * Aurora Protocol — Fas 0 bootstrap.
+ * Aurora Protocol — B0 bootstrap: real gameplay.
  *
- * Boots the WebGPU renderer, generates the five parallax layers, loads
- * level 1 ("Mnemosynes fall") and starts a fixed-timestep loop that slowly
- * pans the camera across it. Background + tiles are visible; the player entity arrives in
- * wave A. State machine: BOOT → MENU → (Space) PLAYING ⇄ PAUSED.
- * On first boot the skippable B4 intro cinematic plays during BOOT before MENU.
+ * Boots the WebGPU renderer + parallax, then runs fixed-timestep sessions of
+ * {@link GameSession} (player, enemies, projectiles, pickups, checkpoints).
+ * State machine: BOOT → MENU → (Space) PLAYING ⇄ PAUSED / → GAMEOVER →
+ * PLAYING … → WIN → MENU. Camera follows AURORA; HUD shows score/lives/
+ * weapon/combo plus the B5 level/total clocks and the B1 juice telemetry;
+ * procedural SFX fire on gameplay events.
+ *
+ * On first boot the skippable B4 intro cinematic plays during BOOT before
+ * MENU (once per page session; any key/tap skips straight to the menu and
+ * the HUD stays hidden until gameplay begins).
+ *
+ * B1 juice (PLAN.md §4 "Juice & effekter") routes through {@link JuiceSystem},
+ * the shared effects façade: jump/land/shoot are observed from the player
+ * each step, and gameplay events drive the particle/shake/bloom recipes.
+ * Screen shake offsets the camera transform; a fullscreen additive quad
+ * renders the death/explosion screen flash.
  */
 
-/** Demo camera pan speed in world px/s. */
-const CAMERA_SPEED_PX_PER_S = 140;
-
-// Neon tile palette for the test level (tints over the white 1×1 texture).
+// Neon palette (tints over the white 1×1 texture).
 const TINT_SOLID_A: Rgba = [0.16, 0.9, 1.0, 1];
 const TINT_SOLID_B: Rgba = [0.1, 0.62, 0.95, 1];
 const TINT_PLATFORM: Rgba = [1.0, 0.35, 0.85, 1];
 const TINT_HAZARD: Rgba = [1.0, 0.45, 0.15, 1];
 const GLOW_HAZARD: Rgba = [1.0, 0.45, 0.15, 1.4];
-const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.9];
-const GLOW_MARKER_CHECKPOINT: Rgba = [1.0, 0.92, 0.35, 2.2];
-const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.95];
-const GLOW_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 2.6];
-const TINT_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 0.8];
-const GLOW_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 2.4];
 
-interface DemoState {
-  cameraX: number;
-  cameraDir: 1 | -1;
+const PLAYER_COLOR: Rgba = [0.45, 0.95, 1, 1];
+const PLAYER_CORE_COLOR: Rgba = [1, 1, 1, 1];
+const PROJECTILE_PLAYER_COLOR: Rgba = [0.7, 1, 1, 1];
+const PROJECTILE_ENEMY_COLOR: Rgba = [1, 0.4, 0.4, 1];
+
+const CHECKPOINT_INACTIVE: Rgba = [1.0, 0.9, 0.3, 0.5];
+const CHECKPOINT_ACTIVE: Rgba = [1.0, 0.95, 0.45, 0.95];
+const EXIT_COLOR: Rgba = [0.55, 1.0, 0.45, 0.95];
+
+const PICKUP_FRAGMENT_COLOR: Rgba = [1.0, 0.4, 0.9, 0.9];
+const PICKUP_POWERUP_COLOR: Rgba = [0.4, 1.0, 0.9, 0.9];
+const PICKUP_UNLOCK_COLOR: Rgba = [1.0, 0.85, 0.3, 1];
+
+/** Transient HUD toast. */
+interface Toast {
+  text: string;
+  expiresAtMs: number;
+}
+
+interface FrameLatches {
+  jump: boolean;
+  pause: boolean;
+  confirm: boolean;
+  swap: boolean;
 }
 
 async function boot(): Promise<void> {
@@ -68,9 +102,10 @@ async function boot(): Promise<void> {
   const parallax = new ParallaxBackground(renderer);
   await parallax.generate();
 
-  const level = new Level(getLevel(1));
   const input = new InputManager();
   input.attach(window);
+  const detachTouchUi = setupTouchControls(input);
+
   const save = new SaveStore();
   const audio = new AudioEngine();
   audio.applySettings(save.load().settings); // persisted volumes (SaveStore hook)
@@ -83,6 +118,11 @@ async function boot(): Promise<void> {
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
   const hudRoot = document.getElementById('hud-root');
   const state = new GameStateMachine();
+  // Task B5: level + total run clocks, kept in sync with the state machine
+  // (MENU→PLAYING starts the run, PAUSED pauses, GAMEOVER restarts the level
+  // clock while total keeps accumulating — speedrun rules per PLAN.md §4).
+  const timer = new LevelTimer();
+  const detachTimerSync = attachLevelTimer(state, timer);
 
   // ---- B4 intro (skippable, once per page session) ------------------------
   let intro: IntroSequence | null = null;
@@ -102,29 +142,442 @@ async function boot(): Promise<void> {
     state.transition(GameStateName.Menu); // assets are ready → show menu
   }
 
-  const demo: DemoState = { cameraX: 0, cameraDir: 1 };
+  // ---- B1 juice -------------------------------------------------------------
+  const juice = new JuiceSystem({
+    setBloom: (patch) => renderer.setBloomOptions(patch),
+  });
 
-  /** Build sprite list for tiles currently visible through the virtual view. */
-  const buildTileSprites = (): SpriteDraw[] => {
-    const sprites: SpriteDraw[] = [];
+  /** Fullscreen additive quad while the screen-flash envelope is active. */
+  const flashQuad: SpriteDraw[] = [{ x: 0, y: 0, width: 0, height: 0 }];
+  const flashColor: [number, number, number, number] = [1, 1, 1, 0];
+  const drawScreenFlash = (): void => {
+    if (!juice.screenFlash.isActive) return;
     const bounds = renderer.viewBounds;
+    const quad = flashQuad[0]!;
+    quad.x = bounds.left;
+    quad.y = bounds.top;
+    quad.width = bounds.right - bounds.left;
+    quad.height = bounds.bottom - bounds.top;
+    quad.tint = juice.screenFlash.currentColor(flashColor);
+    quad.blend = 'additive';
+    renderer.drawSprites('white', flashQuad);
+  };
 
-    // Camera maps world→view by simple translation: viewX = worldX - cameraX.
-    const worldLeft = demo.cameraX + bounds.left;
-    const worldRight = demo.cameraX + bounds.right;
+  // ---- Gameplay bookkeeping -------------------------------------------------
+  let levelIndex = 1;
+  let session: GameSession | null = null;
+  let carriedDoubleJump = false;
+  let toast: Toast | null = null;
+  /** Set when the current level finished; consumed by the progression step. */
+  let levelFinished = false;
 
-    const tx0 = Math.max(0, Math.floor(worldLeft / TILE_SIZE));
-    const tx1 = Math.min(level.widthTiles - 1, Math.ceil(worldRight / TILE_SIZE));
-    if (tx1 < tx0) return sprites;
+  const sfxSink = (name: SfxName, options?: { step?: number }): void => {
+    audio.playSfx(name, options);
+  };
 
+  const showToast = (text: string, durationMs = 2200): void => {
+    toast = { text, expiresAtMs: performance.now() + durationMs };
+  };
+
+  const startLevel = (index: number): void => {
+    const data = campaignLevel(index);
+    if (!data) return;
+    session = new GameSession({
+      levelData: data,
+      hooks: { sfx: sfxSink, onEvent: handleGameEvent },
+      seed: 0xa7001 + index * 7919,
+    });
+    if (carriedDoubleJump) session.player.abilities.doubleJumpUnlocked = true;
+    levelFinished = false;
+    timer.restartLevel(); // fresh attempt → per-level clock back to 00:00.00
+    prevPlayerGrounded = true;
+    prevPlayerVy = 0;
+    prevProjectileCount = 0;
+    void audio.playMusic(data.id);
+  };
+
+  function handleGameEvent(event: GameEvent): void {
+    // B1 juice recipes keyed off gameplay events (positions approximate the
+    // player anchor unless the event carries its own coordinates).
+    if (session) {
+      const p = session.player;
+      switch (event.type) {
+        case 'fragment-collected':
+          juice.fragmentPickup(p.centerX, p.centerY);
+          break;
+        case 'enemy-killed':
+          juice.enemyDeath(p.centerX, p.centerY);
+          break;
+        case 'player-died':
+          juice.playerDeath(p.centerX, p.centerY);
+          break;
+        case 'checkpoint-activated':
+          juice.shake.addTrauma(0.22);
+          juice.bloom.pulse(0.35);
+          break;
+        case 'powerup-collected':
+          juice.bloom.pulse(0.3);
+          break;
+        case 'unlock-granted':
+          juice.bloom.pulse(0.55);
+          break;
+        case 'level-complete':
+          juice.bloom.pulse(0.6);
+          break;
+        default:
+          break;
+      }
+    }
+
+    switch (event.type) {
+      case 'checkpoint-activated':
+        showToast(`CHECKPOINT · +${CHECKPOINT_BONUS}`);
+        break;
+      case 'unlock-granted':
+        showToast(`UNLOCKED — ${event.unlock}`, 3200);
+        carriedDoubleJump = true;
+        break;
+      case 'powerup-collected':
+        showToast(POWERUPS[event.powerup]?.blurb ?? event.powerup);
+        break;
+      case 'level-complete':
+        levelFinished = true;
+        break;
+      default:
+        break;
+    }
+  }
+
+  /** Level data for 1-based index, or undefined past the built campaign. */
+  function campaignLevel(index: number) {
+    return CAMPAIGN_LEVELS.find((l) => l.index === index);
+  }
+
+  // ---- B1 continuous juice observers ---------------------------------------
+  // Player state from the previous fixed step, used to detect jump/land
+  // edges and newly fired projectiles (the session exposes no dedicated
+  // hooks for those moments).
+  let prevPlayerGrounded = true;
+  let prevPlayerVy = 0;
+  let prevProjectileCount = 0;
+  let lastAimX = 1;
+  let lastAimY = 0;
+
+  const applyGameplayJuice = (): void => {
+    if (!session) return;
+    const p = session.player;
+
+    const shotCount = session.activeProjectiles.length;
+    if (shotCount > prevProjectileCount) {
+      const len = Math.hypot(lastAimX, lastAimY) || 1;
+      juice.shoot(
+        p.centerX + (lastAimX / len) * 16,
+        p.centerY + (lastAimY / len) * 16,
+        Math.atan2(lastAimY, lastAimX),
+      );
+    }
+    prevProjectileCount = shotCount;
+
+    if (!prevPlayerGrounded && p.grounded) {
+      const impact = Math.min(2, Math.abs(prevPlayerVy) / 700);
+      juice.land(p.centerX, p.centerY + p.height / 2, impact);
+    } else if (prevPlayerGrounded && !p.grounded && p.vy < 0) {
+      juice.jump(p.centerX, p.centerY + p.height / 2);
+    }
+    prevPlayerGrounded = p.grounded;
+    prevPlayerVy = p.vy;
+  };
+
+  // Per-frame input latches: fixed-step updates may run 0..N times per frame,
+  // so edge-triggered actions are captured once and explicitly consumed.
+  const latches: FrameLatches = { jump: false, pause: false, confirm: false, swap: false };
+  const refreshLatches = (): void => {
+    latches.jump = input.wasPressed(InputAction.Jump);
+    latches.pause = input.wasPressed(InputAction.Pause);
+    latches.confirm = input.wasPressed(InputAction.Confirm);
+    latches.swap = input.wasPressed(InputAction.SwapWeapon);
+  };
+  const takeLatch = (key: keyof FrameLatches): boolean => {
+    const value = latches[key];
+    latches[key] = false;
+    return value;
+  };
+
+  // Pointer aim (desktop): last known position in virtual view space.
+  let pointerView: { x: number; y: number } | null = null;
+  const onPointerMove = (event: PointerEvent): void => {
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const bounds = renderer.viewBounds;
+    const nx = (event.clientX - rect.left) / rect.width;
+    const ny = (event.clientY - rect.top) / rect.height;
+    pointerView = {
+      x: bounds.left + nx * (bounds.right - bounds.left),
+      y: bounds.top + ny * (bounds.bottom - bounds.top),
+    };
+  };
+  canvas.addEventListener('pointermove', onPointerMove);
+
+  function buildPlayerInput(): PlayerInput {
+    if (!session) return emptyPlayerInput();
+
+    const moveLeft = input.isDown(InputAction.Left) ? 1 : 0;
+    const moveRight = input.isDown(InputAction.Right) ? 1 : 0;
+    const moveX = moveRight - moveLeft;
+
+    const p = session.player;
+    let aim: PlayerInput['aim'] = null;
+    if (pointerView) {
+      const worldX = pointerView.x + session.cameraX;
+      const worldY = pointerView.y + session.cameraY;
+      const dx = worldX - p.centerX;
+      const dy = worldY - p.centerY;
+      const len = Math.hypot(dx, dy);
+      if (len > 8) aim = { x: dx / len, y: dy / len };
+    }
+    if (aim) {
+      lastAimX = aim.x;
+      lastAimY = aim.y;
+    } else if (moveX !== 0) {
+      lastAimX = moveX;
+      lastAimY = 0;
+    }
+
+    return {
+      moveX,
+      jumpPressed: takeLatch('jump'),
+      jumpHeld: input.isDown(InputAction.Jump),
+      shootHeld: input.isDown(InputAction.Shoot),
+      aim,
+    };
+  }
+
+  // ---- Progression ----------------------------------------------------------
+  function handleLevelProgression(): void {
+    if (!session || !levelFinished) return;
+
+    const data = session.level.data;
+    const saveData = save.load();
+    save.recordLevelResult(saveData, data.id, session.score.score, session.timeMs);
+    save.save(audio.captureVolumesInto(saveData));
+
+    const nextIndex = levelIndex + 1;
+    if (campaignLevel(nextIndex)) {
+      levelIndex = nextIndex;
+      startLevel(levelIndex);
+      showToast(`LEVEL ${levelIndex} — ${session.level.data.name}`, 2600);
+    } else {
+      state.transition(GameStateName.Win);
+      audio.stopMusic();
+      // Task B5: bank the speedrun total (fastest complete campaign run wins).
+      const runSaveData = save.load();
+      const isNewBestRun = save.recordRunTime(runSaveData, timer.totalElapsedMs);
+      save.save(audio.captureVolumesInto(runSaveData));
+      showToast(
+        `ARCHIVE RESTORED — TOTAL ${runSaveData.totalScore}` +
+          (isNewBestRun ? ' · NEW BEST RUN TIME!' : ''),
+        6000,
+      );
+    }
+  }
+
+  // ---- Fixed-timestep loop --------------------------------------------------
+  const loop = new GameLoop({
+    update(stepMs) {
+      // Intro owns BOOT: advance it, and swallow the frame that ends it so a
+      // skip keypress never leaks into the menu's "press SPACE to start".
+      if (intro && state.current === GameStateName.Boot) {
+        intro.update(stepMs / 1000);
+        if (intro.playback.finished) {
+          input.endFrame();
+          return;
+        }
+      }
+
+      // Clocks only accumulate while PLAYING (timer guards internally).
+      timer.advance(stepMs);
+
+      // ---- state machine (edge-latched so multi-step frames can't toggle) --
+      switch (state.current) {
+        case GameStateName.Menu:
+          if (takeLatch('confirm') || takeLatch('jump')) {
+            levelIndex = 1;
+            carriedDoubleJump = false;
+            startLevel(levelIndex);
+            state.transition(GameStateName.Playing);
+            audio.playSfx('checkpoint');
+          }
+          break;
+
+        case GameStateName.Paused:
+          if (takeLatch('pause') || takeLatch('confirm')) {
+            state.transition(GameStateName.Playing);
+            audio.resumeMusic();
+          }
+          break;
+
+        case GameStateName.GameOver:
+          if (takeLatch('confirm') || takeLatch('jump')) {
+            startLevel(levelIndex); // fresh attempt, 3 lives, score zeroed
+            state.transition(GameStateName.Playing);
+          }
+          break;
+
+        case GameStateName.Win:
+          if (takeLatch('confirm') || takeLatch('jump')) {
+            state.transition(GameStateName.Menu);
+          }
+          break;
+
+        case GameStateName.Playing:
+          if (takeLatch('pause')) {
+            state.transition(GameStateName.Paused);
+            audio.pauseMusic();
+            break;
+          }
+          if (takeLatch('swap')) {
+            audio.playSfx('weapon-switch');
+            showToast('PULS equipped — more weapons unlock via total score');
+          }
+          break;
+
+        default:
+          break;
+      }
+
+      // ---- simulation ------------------------------------------------------
+      if (state.current === GameStateName.Playing && session) {
+        if (session.status === 'gameOver') {
+          state.transition(GameStateName.GameOver);
+        } else if (session.status === 'levelComplete' || levelFinished) {
+          handleLevelProgression();
+        } else {
+          session.update(stepMs, buildPlayerInput());
+          applyGameplayJuice();
+        }
+      }
+
+      // B1 envelopes decay in every state so flashes/shake settle gracefully
+      // across pause/game-over transitions.
+      juice.update(stepMs / 1000);
+
+      input.endFrame();
+    },
+
+    render() {
+      refreshLatches();
+
+      // B4 intro owns BOOT: draw the cinematic over black and keep the HUD
+      // hidden until the menu/gameplay UI takes over.
+      const introActive = state.current === GameStateName.Boot && intro !== null;
+      if (introActive) {
+        renderer.beginFrame([0, 0, 0, 1]);
+        (intro as IntroSequence).render();
+        renderer.endFrame();
+        if (hudRoot) hudRoot.style.display = 'none';
+        return;
+      }
+
+      // B1 screen shake rides the camera transform: everything world-space
+      // (parallax pan + tiles/entities) shifts by the trauma noise; the DOM
+      // HUD stays steady.
+      const cameraX = session?.cameraX ?? 0;
+      const panX = cameraX - juice.shake.offsetX;
+      const offsetY = juice.shake.offsetY;
+
+      renderer.beginFrame([0.03, 0.01, 0.09, 1]);
+      parallax.draw(panX);
+
+      if (session) {
+        renderer.drawSprites('white', buildWorldSprites(renderer, session, panX, offsetY));
+        renderer.drawSprites('white', juice.particles.buildDraws());
+      }
+      drawScreenFlash();
+      renderer.endFrame();
+
+      if (hudRoot) hudRoot.style.display = '';
+      hud.update({
+        gameStateName: state.current,
+        levelName: session?.level.data.name ?? '—',
+        fps: loop.fps,
+        cameraX,
+        message: currentMessage(),
+        score: session?.score.score,
+        lives: session?.lives,
+        weapon: session ? 'PULS' : undefined,
+        comboMultiplier: session?.score.multiplier,
+        timeSeconds: session ? session.timeMs / 1000 : undefined,
+        timeText: timer.formatLevelTime(),
+        totalTimeText: timer.formatTotalTime(),
+        juiceLine: juice.statsLine(),
+      });
+    },
+  });
+
+  function currentMessage(): string | null {
+    const now = performance.now();
+    if (toast && toast.expiresAtMs < now) toast = null;
+
+    switch (state.current) {
+      case GameStateName.Menu:
+        return 'PRESS SPACE TO START · ARROWS/AD MOVE · SPACE JUMP · J SHOOT · P PAUSE';
+      case GameStateName.Paused:
+        return 'PAUSED — P OR ENTER TO RESUME';
+      case GameStateName.GameOver:
+        return 'GAME OVER — ENTER TO RETRY THIS LEVEL';
+      case GameStateName.Win:
+        return 'AURORA PROTOCOL COMPLETE — THE ARCHIVE IS SAFE. ENTER FOR MENU.';
+      default:
+        return toast?.text ?? session?.level.data.intro ?? null;
+    }
+  }
+
+  window.addEventListener('beforeunload', () => {
+    loop.stop();
+    input.detach();
+    canvas.removeEventListener('pointermove', onPointerMove);
+    detachTouchUi();
+    detachAudioUnlock();
+    detachTimerSync();
+    intro?.dispose();
+    audio.dispose();
+    hud.destroy();
+  });
+
+  loop.start();
+  refreshLatches();
+}
+
+// ---------------------------------------------------------------------------
+// World rendering: tiles + entities as batched neon sprites. `panX` is the
+// (shake-modified) camera X; `offsetY` is the shake Y applied to every world
+// sprite so vertical trauma moves the gameplay layer too.
+// ---------------------------------------------------------------------------
+
+function buildWorldSprites(
+  renderer: WebGPURenderer,
+  session: GameSession,
+  panX: number,
+  offsetY: number,
+): SpriteDraw[] {
+  const sprites: SpriteDraw[] = [];
+  const level = session.level;
+  const camY = session.cameraY + offsetY;
+  const bounds = renderer.viewBounds;
+
+  // --- tiles ---------------------------------------------------------------
+  const worldLeft = panX + bounds.left;
+  const worldRight = panX + bounds.right;
+  const tx0 = Math.max(0, Math.floor(worldLeft / TILE_SIZE));
+  const tx1 = Math.min(level.widthTiles - 1, Math.ceil(worldRight / TILE_SIZE));
+  if (tx1 >= tx0) {
     for (let ty = 0; ty < level.heightTiles; ty++) {
+      const y = Level.tileToWorldY(ty) - camY;
+      if (y < bounds.top - TILE_SIZE || y > bounds.bottom) continue;
       for (let tx = tx0; tx <= tx1; tx++) {
         const tile = level.tileAt(tx, ty);
         if (tile === TileType.Empty) continue;
-
-        const x = Level.tileToWorldX(tx) - demo.cameraX;
-        const y = Level.tileToWorldY(ty);
-
+        const x = Level.tileToWorldX(tx) - panX;
         switch (tile) {
           case TileType.Solid:
             sprites.push({
@@ -135,7 +588,7 @@ async function boot(): Promise<void> {
               tint: (tx + ty) % 2 === 0 ? TINT_SOLID_A : TINT_SOLID_B,
             });
             break;
-          case TileType.Platform: // thin one-way platform slab
+          case TileType.Platform:
             sprites.push({ x, y, width: TILE_SIZE, height: 10, tint: TINT_PLATFORM });
             break;
           case TileType.Hazard:
@@ -151,137 +604,192 @@ async function boot(): Promise<void> {
         }
       }
     }
+  }
 
-    // Spawn-layer entities as additive glowing markers so the data is visible
-    // in-demo (exercises the neon-glow sprite path from the A1 wave).
-    for (const spawn of level.data.spawns) {
-      if (spawn.kind === 'playerSpawn') continue;
-      const isCheckpoint = spawn.kind === 'checkpoint';
-      const isExit = spawn.kind === 'exit';
-      const height = TILE_SIZE * 2;
-      sprites.push({
-        x: Level.tileToWorldX(spawn.tx) + 10 - demo.cameraX,
-        y: Level.tileToWorldY(spawn.ty + 1) - height,
-        width: 12,
-        height,
-        tint: isCheckpoint
-          ? TINT_MARKER_CHECKPOINT
-          : isExit
-            ? TINT_MARKER_GOAL
-            : TINT_MARKER_PICKUP,
-        glow: isCheckpoint
-          ? GLOW_MARKER_CHECKPOINT
-          : isExit
-            ? GLOW_MARKER_GOAL
-            : GLOW_MARKER_PICKUP,
-        blend: 'additive',
-      });
-    }
+  // --- checkpoints & exit ---------------------------------------------------
+  for (const checkpoint of session.checkpoints) {
+    sprites.push({
+      x: checkpoint.worldX + 10 - panX,
+      y: checkpoint.worldY - 32 - camY,
+      width: 12,
+      height: 64,
+      tint: checkpoint.activated ? CHECKPOINT_ACTIVE : CHECKPOINT_INACTIVE,
+      glow: checkpoint.activated ? [1.0, 0.92, 0.35, 2.2] : [1.0, 0.9, 0.3, 0.6],
+      blend: 'additive',
+    });
+  }
+  const exit = session.exitBoxOrNull;
+  if (exit) {
+    sprites.push({
+      x: exit.x - panX,
+      y: exit.y - camY,
+      width: exit.width,
+      height: exit.height,
+      tint: EXIT_COLOR,
+      glow: [0.55, 1.0, 0.45, 2.4],
+      blend: 'additive',
+    });
+  }
 
-    return sprites;
-  };
+  // --- pickups ---------------------------------------------------------------
+  for (const pickup of session.activePickups) {
+    const color = pickupColor(pickup);
+    sprites.push({
+      x: pickup.position.x - panX,
+      y: pickup.position.y - camY,
+      width: pickup.size.x,
+      height: pickup.size.y,
+      tint: color,
+      glow: color,
+      blend: 'additive',
+    });
+  }
 
-  // ---- Fixed-timestep loop --------------------------------------------------
-  const loop = new GameLoop({
-    update(stepMs) {
-      const stepSeconds = stepMs / 1000;
+  // --- enemies -----------------------------------------------------------------
+  for (const enemy of session.activeEnemies) {
+    const base = ENEMY_COLORS_FALLBACK[enemy.kind as EnemyTypeName] ?? ([1, 1, 1, 1] as Rgba);
+    const flashing = enemy.hitFlashMs > 0;
+    const tint: Rgba = flashing ? [1, 1, 1, 1] : base;
+    sprites.push({
+      x: enemy.position.x - panX,
+      y: enemy.position.y - camY,
+      width: enemy.size.x,
+      height: enemy.size.y,
+      tint,
+      glow: tint,
+    });
+  }
 
-      // Intro owns BOOT: advance it, and swallow the frame that ends it so a
-      // skip keypress never leaks into the menu's "press SPACE to start".
-      if (intro && state.current === GameStateName.Boot) {
-        intro.update(stepSeconds);
-        if (intro.playback.finished) {
-          input.endFrame();
-          return;
-        }
-      }
+  // --- player (blinks while invulnerable) ---------------------------------------
+  const p = session.player;
+  const blinkHidden =
+    p.isInvulnerable && Math.floor(session.timeMs / 80) % 2 === 1;
+  if (!blinkHidden) {
+    sprites.push({
+      x: p.x - 3 - panX,
+      y: p.y - 3 - camY,
+      width: p.width + 6,
+      height: p.height + 6,
+      tint: [PLAYER_COLOR[0], PLAYER_COLOR[1], PLAYER_COLOR[2], 0.5],
+      glow: [PLAYER_COLOR[0], PLAYER_COLOR[1], PLAYER_COLOR[2], 1.6],
+      blend: 'additive',
+    });
+    sprites.push({
+      x: p.x - panX,
+      y: p.y - camY,
+      width: p.width,
+      height: p.height,
+      tint: PLAYER_COLOR,
+    });
+    sprites.push({
+      x: p.centerX - 4 - panX,
+      y: p.centerY - 4 - camY,
+      width: 8,
+      height: 8,
+      tint: PLAYER_CORE_COLOR,
+      glow: [1, 1, 1, 2],
+      blend: 'additive',
+    });
+  }
 
-      // Edge-triggered actions drive the state machine.
-      if (
-        state.current === GameStateName.Menu &&
-        (input.wasPressed(InputAction.Confirm) || input.wasPressed(InputAction.Jump))
-      ) {
-        state.transition(GameStateName.Playing);
-        audio.playSfx('checkpoint');
-        // Per-level track; warns once and stays silent until Fas 5 adds mp3s.
-        void audio.playMusic(level.data.id);
-      }
-      if (
-        state.current === GameStateName.Paused &&
-        (input.wasPressed(InputAction.Pause) || input.wasPressed(InputAction.Confirm))
-      ) {
-        state.transition(GameStateName.Playing);
-        audio.resumeMusic();
-      }
-      if (state.current === GameStateName.Playing && input.wasPressed(InputAction.Pause)) {
-        state.transition(GameStateName.Paused);
-        audio.pauseMusic();
-      }
+  // --- projectiles ----------------------------------------------------------------
+  const projectileSprites: SpriteDraw[] = session.activeProjectiles.map((shot: Projectile) => ({
+    x: shot.position.x - panX,
+    y: shot.position.y - camY,
+    width: shot.size.x,
+    height: shot.size.y,
+    tint: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
+    glow: shot.owner === 'player' ? PROJECTILE_PLAYER_COLOR : PROJECTILE_ENEMY_COLOR,
+    blend: 'additive',
+  }));
+  pushAll(sprites, projectileSprites);
 
-      // Auto-pan the camera while playing (ping-pong across the level).
-      if (state.current === GameStateName.Playing) {
-        const maxCameraX = Math.max(0, level.pixelWidth - VIRTUAL_WIDTH);
-        demo.cameraX += demo.cameraDir * CAMERA_SPEED_PX_PER_S * stepSeconds;
-        if (demo.cameraX >= maxCameraX) {
-          demo.cameraX = maxCameraX;
-          demo.cameraDir = -1;
-        } else if (demo.cameraX <= 0) {
-          demo.cameraX = 0;
-          demo.cameraDir = 1;
-        }
-      }
+  // --- particles --------------------------------------------------------------------
+  const particleSprites: SpriteDraw[] = session.particles.active.map((particle: Particle) => ({
+    x: particle.x - particle.sizePx / 2 - panX,
+    y: particle.y - particle.sizePx / 2 - camY,
+    width: particle.sizePx,
+    height: particle.sizePx,
+    tint: [
+      particle.color[0],
+      particle.color[1],
+      particle.color[2],
+      Math.max(0, Math.min(1, particle.lifeSeconds / particle.maxLifeSeconds)),
+    ] as Rgba,
+    blend: 'additive',
+  }));
+  pushAll(sprites, particleSprites);
 
-      input.endFrame();
-    },
-    render() {
-      const introActive = state.current === GameStateName.Boot && intro !== null;
-
-      if (introActive) {
-        renderer.beginFrame([0, 0, 0, 1]);
-        (intro as IntroSequence).render();
-      } else {
-        renderer.beginFrame([0.03, 0.01, 0.09, 1]);
-        parallax.draw(demo.cameraX);
-        renderer.drawSprites('white', buildTileSprites()); // tiles on top of parallax
-      }
-      renderer.endFrame();
-
-      if (introActive) {
-        if (hudRoot) hudRoot.style.display = 'none';
-        return;
-      }
-      if (hudRoot) hudRoot.style.display = '';
-      hud.update({
-        gameStateName: state.current,
-        levelName: level.data.name,
-        fps: loop.fps,
-        cameraX: demo.cameraX,
-        message: stateMessage(state.current),
-      });
-    },
-  });
-
-  window.addEventListener('beforeunload', () => {
-    loop.stop();
-    input.detach();
-    detachAudioUnlock();
-    intro?.dispose();
-    audio.dispose();
-    hud.destroy();
-  });
-
-  loop.start();
+  return sprites;
 }
 
-function stateMessage(state: GameStateName): string | null {
-  switch (state) {
-    case GameStateName.Menu:
-      return 'Press SPACE to start · P pauses';
-    case GameStateName.Paused:
-      return 'PAUSED — press P or ENTER to resume';
-    default:
-      return null;
+function pushAll(target: SpriteDraw[], items: readonly SpriteDraw[]): void {
+  for (const item of items) target.push(item);
+}
+
+function pickupColor(pickup: Pickup): Rgba {
+  if (pickup.kind === 'unlock') return PICKUP_UNLOCK_COLOR;
+  if (pickup.kind === 'powerup') return PICKUP_POWERUP_COLOR;
+  return FRAGMENT_TINTS[pickup.fragment ?? 'Music'] ?? PICKUP_FRAGMENT_COLOR;
+}
+
+const FRAGMENT_TINTS: Readonly<Record<FragmentTypeName, Rgba>> = {
+  Music: [1.0, 0.45, 0.75, 0.9],
+  Science: [0.45, 0.85, 1.0, 0.9],
+  Language: [1.0, 0.85, 0.45, 0.9],
+  Art: [0.75, 0.5, 1.0, 0.9],
+  History: [1.0, 0.6, 0.4, 0.9],
+  Medicine: [0.5, 1.0, 0.65, 0.9],
+  Philosophy: [1.0, 1.0, 0.6, 0.9],
+};
+
+// ---------------------------------------------------------------------------
+// Touch controls (multi-touch via InputManager.bindTouchButton).
+// ---------------------------------------------------------------------------
+
+function setupTouchControls(input: InputManager): () => void {
+  const isCoarsePointer =
+    typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+  const hasTouch = typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0;
+  if (!isCoarsePointer && !hasTouch) return () => undefined;
+
+  const container = document.createElement('div');
+  container.className = 'touch-ui';
+  container.innerHTML = `
+    <div class="touch-group touch-left">
+      <button class="touch-btn" data-action="left" aria-label="Move left">◀</button>
+      <button class="touch-btn" data-action="right" aria-label="Move right">▶</button>
+    </div>
+    <div class="touch-group touch-right">
+      <button class="touch-btn" data-action="shoot" aria-label="Shoot">FIRE</button>
+      <button class="touch-btn" data-action="jump" aria-label="Jump">JUMP</button>
+    </div>
+  `;
+  document.body.appendChild(container);
+
+  const detachers: Array<() => void> = [];
+  for (const button of Array.from(container.querySelectorAll('.touch-btn'))) {
+    const element = button as HTMLElement;
+    const action = element.dataset.action;
+    const mapped =
+      action === 'left'
+        ? InputAction.Left
+        : action === 'right'
+          ? InputAction.Right
+          : action === 'jump'
+            ? InputAction.Jump
+            : action === 'shoot'
+              ? InputAction.Shoot
+              : null;
+    if (!mapped) continue;
+    element.classList.add('no-select');
+    detachers.push(input.bindTouchButton(element, mapped));
   }
+
+  return () => {
+    for (const detach of detachers) detach();
+    container.remove();
+  };
 }
 
 boot().catch((error) => {

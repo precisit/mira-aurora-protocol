@@ -1,8 +1,8 @@
 /**
- * HUD skeleton (PLAN.md §5 src/ui — full HUD lands in wave A).
- *
- * `HudState` is the pure data contract between game code and any UI
- * implementation; `DomHud` is a minimal DOM renderer used by the Fas 0 demo.
+ * HUD (PLAN.md §5 src/ui). `HudState` is the pure data contract between game
+ * code and any UI implementation; `DomHud` is a minimal DOM renderer used by
+ * main.ts. B0 adds score/lives/weapon/combo readouts, task B5 the level/total
+ * time clocks and B1 a juice telemetry line.
  */
 
 export interface HudState {
@@ -10,8 +10,24 @@ export interface HudState {
   levelName: string;
   fps: number;
   cameraX: number;
+  /** Current level clock formatted as mm:ss.xx (task B5); null hides it. */
+  timeText: string | null;
+  /** Total run clock formatted as mm:ss.xx (speedrun total, task B5). */
+  totalTimeText: string | null;
   /** Transient message (menu hints, pause text); null hides it. */
   message: string | null;
+  /** Level-attempt score (already includes combo multipliers). */
+  score?: number;
+  /** Lives remaining this level. */
+  lives?: number;
+  /** Equipped weapon display name, e.g. "PULS". */
+  weapon?: string;
+  /** Current combo multiplier tier (1 = no combo). */
+  comboMultiplier?: number;
+  /** Elapsed level time in seconds (fractional). */
+  timeSeconds?: number;
+  /** B1 "juice" telemetry line (particles/shake/bloom); null hides it. */
+  juiceLine?: string | null;
 }
 
 export interface Hud {
@@ -26,7 +42,15 @@ export class DomHud implements Hud {
     this.root = document.createElement('div');
     this.root.className = 'hud';
     host.appendChild(this.root);
-    this.render({ gameStateName: '-', levelName: '-', fps: 0, cameraX: 0, message: null });
+    this.render({
+      gameStateName: '-',
+      levelName: '-',
+      fps: 0,
+      cameraX: 0,
+      timeText: null,
+      totalTimeText: null,
+      message: null,
+    });
   }
 
   public update(state: HudState): void {
@@ -38,20 +62,35 @@ export class DomHud implements Hud {
   }
 
   private render(state: HudState): void {
-    const parts = [
-      `AURORA PROTOCOL`,
+    const parts: string[] = [
       `state: ${state.gameStateName}`,
       `level: ${state.levelName}`,
       `${Math.round(state.fps)} fps`,
     ];
-    let html = `<span class="hud-title">${parts[0]}</span><span>${parts.slice(1).join(' · ')}</span>`;
+    if (typeof state.score === 'number') parts.unshift(`SCORE ${formatScore(state.score)}`);
+    if (typeof state.lives === 'number') parts.splice(1, 0, `LIVES ${'◆'.repeat(Math.max(0, state.lives)) || '—'}`);
+    if (state.weapon) parts.push(`WPN ${escapeHtml(state.weapon)}`);
+    if (typeof state.comboMultiplier === 'number' && state.comboMultiplier > 1) {
+      parts.push(`COMBO ×${state.comboMultiplier}`);
+    }
+    if (state.timeText !== null) parts.push(`time: ${state.timeText}`);
+    if (state.totalTimeText !== null) parts.push(`total: ${state.totalTimeText}`);
+    if (typeof state.timeSeconds === 'number') {
+      parts.push(`${state.timeSeconds.toFixed(1)}s`);
+    }
+    let html = `<span class="hud-title">AURORA PROTOCOL</span><span>${parts.join(' · ')}</span>`;
     if (state.message) html += `<span class="hud-message">${escapeHtml(state.message)}</span>`;
+    if (state.juiceLine) html += `<span class="hud-juice">${escapeHtml(state.juiceLine)}</span>`;
     this.root.innerHTML = html;
   }
 
   public destroy(): void {
     this.root.remove();
   }
+}
+
+function formatScore(score: number): string {
+  return Math.max(0, Math.round(score)).toString().padStart(6, '0');
 }
 
 function escapeHtml(text: string): string {
