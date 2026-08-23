@@ -13,6 +13,7 @@ import {
   type SpriteDraw,
 } from './renderer/WebGPURenderer';
 import { DomHud } from './ui/Hud';
+import { IntroSequence } from './ui/IntroSequence';
 import { SaveStore } from './save/SaveStore';
 import './style.css';
 
@@ -23,6 +24,7 @@ import './style.css';
  * level 1 ("Mnemosynes fall") and starts a fixed-timestep loop that slowly
  * pans the camera across it. Background + tiles are visible; the player entity arrives in
  * wave A. State machine: BOOT → MENU → (Space) PLAYING ⇄ PAUSED.
+ * On first boot the skippable B4 intro cinematic plays during BOOT before MENU.
  */
 
 /** Demo camera pan speed in world px/s. */
@@ -72,10 +74,33 @@ async function boot(): Promise<void> {
   const save = new SaveStore();
   const audio = new AudioEngine();
   audio.applySettings(save.load().settings); // persisted volumes (SaveStore hook)
-  const detachAudioUnlock = audio.initOnInteraction(window, () => audio.playSfx('ui-click'));
+  const detachAudioUnlock = audio.initOnInteraction(window, () => {
+    // First user interaction unlocks WebAudio; greet with the intro sting
+    // while the cinematic is still running, otherwise the usual UI click.
+    const inIntro = intro !== null && !intro.playback.finished;
+    audio.playSfx(inIntro ? 'intro-sting' : 'ui-click');
+  });
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
+  const hudRoot = document.getElementById('hud-root');
   const state = new GameStateMachine();
-  state.transition(GameStateName.Menu); // assets are ready → show menu
+
+  // ---- B4 intro (skippable, once per page session) ------------------------
+  let intro: IntroSequence | null = null;
+  if (IntroSequence.shouldPlay()) {
+    IntroSequence.markPlayed();
+    intro = new IntroSequence(renderer, {
+      parallax,
+      onFinish: () => {
+        input.endFrame(); // the skip keypress must not also start the game
+        if (state.current === GameStateName.Boot) state.transition(GameStateName.Menu);
+      },
+    });
+    intro.start();
+    intro.attach(window); // any key / tap / click skips
+    audio.playSfx('intro-sting'); // silent until audio unlocks; guarded
+  } else {
+    state.transition(GameStateName.Menu); // assets are ready → show menu
+  }
 
   const demo: DemoState = { cameraX: 0, cameraDir: 1 };
 
@@ -159,6 +184,18 @@ async function boot(): Promise<void> {
   // ---- Fixed-timestep loop --------------------------------------------------
   const loop = new GameLoop({
     update(stepMs) {
+      const stepSeconds = stepMs / 1000;
+
+      // Intro owns BOOT: advance it, and swallow the frame that ends it so a
+      // skip keypress never leaks into the menu's "press SPACE to start".
+      if (intro && state.current === GameStateName.Boot) {
+        intro.update(stepSeconds);
+        if (intro.playback.finished) {
+          input.endFrame();
+          return;
+        }
+      }
+
       // Edge-triggered actions drive the state machine.
       if (
         state.current === GameStateName.Menu &&
@@ -183,7 +220,6 @@ async function boot(): Promise<void> {
 
       // Auto-pan the camera while playing (ping-pong across the level).
       if (state.current === GameStateName.Playing) {
-        const stepSeconds = stepMs / 1000;
         const maxCameraX = Math.max(0, level.pixelWidth - VIRTUAL_WIDTH);
         demo.cameraX += demo.cameraDir * CAMERA_SPEED_PX_PER_S * stepSeconds;
         if (demo.cameraX >= maxCameraX) {
@@ -198,11 +234,23 @@ async function boot(): Promise<void> {
       input.endFrame();
     },
     render() {
-      renderer.beginFrame([0.03, 0.01, 0.09, 1]);
-      parallax.draw(demo.cameraX);
-      renderer.drawSprites('white', buildTileSprites()); // tiles on top of parallax
+      const introActive = state.current === GameStateName.Boot && intro !== null;
+
+      if (introActive) {
+        renderer.beginFrame([0, 0, 0, 1]);
+        (intro as IntroSequence).render();
+      } else {
+        renderer.beginFrame([0.03, 0.01, 0.09, 1]);
+        parallax.draw(demo.cameraX);
+        renderer.drawSprites('white', buildTileSprites()); // tiles on top of parallax
+      }
       renderer.endFrame();
 
+      if (introActive) {
+        if (hudRoot) hudRoot.style.display = 'none';
+        return;
+      }
+      if (hudRoot) hudRoot.style.display = '';
       hud.update({
         gameStateName: state.current,
         levelName: level.data.name,
@@ -217,6 +265,7 @@ async function boot(): Promise<void> {
     loop.stop();
     input.detach();
     detachAudioUnlock();
+    intro?.dispose();
     audio.dispose();
     hud.destroy();
   });
