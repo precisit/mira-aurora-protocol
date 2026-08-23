@@ -60,6 +60,12 @@ import {
 } from './bosses';
 import { Level } from '../levels/Level';
 import type { LevelData } from '../levels/LevelData';
+import {
+  laserDamageBox,
+  laserGridFromSpawn,
+  laserTelegraphRect,
+  type LaserGrid,
+} from './lasers';
 import { SeededRng } from '../core/Rng';
 import { VIRTUAL_HEIGHT, VIRTUAL_WIDTH } from '../renderer/types';
 
@@ -163,6 +169,8 @@ export class GameSession {
   private readonly projectiles = new EntityPool<Projectile>(createProjectile);
   private readonly pickups: Pickup[] = [];
   private readonly checkpointList: CheckpointState[] = [];
+  /** Timed laser grids parsed from level data (task C2); empty in plain levels. */
+  private readonly laserGrids: LaserGrid[] = [];
   private exitBox: AABB | null = null;
 
   /** Boss arena parsed from level data (task B2); null in plain levels. */
@@ -369,6 +377,13 @@ export class GameSession {
       return;
     }
 
+    // Corruption clock (glitch tiles) + timed laser grids (task C2).
+    this.level.syncGlitchTiles(this._timeMs);
+    if (!this.player.isInvulnerable && this.laserUnderPlayer()) {
+      this.damagePlayer();
+      if (this._status !== 'playing') return;
+    }
+
     this.handleShooting(input, stepMs);
     this.updateBossFight(dtSeconds);
     if (this._status !== 'playing') return;
@@ -448,6 +463,7 @@ export class GameSession {
     this.enemies.length = 0;
     this.pickups.length = 0;
     this.checkpointList.length = 0;
+    this.laserGrids.length = 0;
     this.exitBox = null;
     for (const item of this.projectiles.active) item.active = false;
     this.particles.clear();
@@ -492,6 +508,11 @@ export class GameSession {
             this.arenaSpawn = spawn;
             this._bossArena = arenaFromTiles(spawn.tx0, spawn.ty0, spawn.tx1, spawn.ty1);
           }
+          break;
+        case 'laser':
+          // Timed environmental beam (task C2): stepped against the session
+          // clock in update() — no entity, just a pulsing damage box.
+          this.laserGrids.push(laserGridFromSpawn(spawn));
           break;
         default:
           break;
@@ -1010,6 +1031,38 @@ export class GameSession {
   }
 
   // ------------------------------------------------- damage/death/rules --
+
+  /** All parsed laser grids (renderer + tests). */
+  public get lasers(): readonly LaserGrid[] {
+    return this.laserGrids;
+  }
+
+  /** Damage boxes of every beam currently firing (renderer + tests). */
+  public firingLaserBoxes(): AABB[] {
+    const boxes: AABB[] = [];
+    for (const grid of this.laserGrids) {
+      const box = laserDamageBox(grid, this._timeMs);
+      if (box) boxes.push(box);
+    }
+    return boxes;
+  }
+
+  /** Blinking warning lines of beams about to fire (renderer). */
+  public telegraphLaserBoxes(): AABB[] {
+    const boxes: AABB[] = [];
+    for (const grid of this.laserGrids) {
+      const box = laserTelegraphRect(grid, this._timeMs);
+      if (box) boxes.push(box);
+    }
+    return boxes;
+  }
+
+  private laserUnderPlayer(): boolean {
+    for (const box of this.firingLaserBoxes()) {
+      if (this.overlapsPlayer(box)) return true;
+    }
+    return false;
+  }
 
   private hazardUnderPlayer(): boolean {
     return touchesHazard(this.level, playerBox(this.player));

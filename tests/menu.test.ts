@@ -307,8 +307,8 @@ describe('highscore table', () => {
     // Built levels use their real data id; unbuilt slots keep the stable key.
     expect(rows[0]?.levelId).toBe('lvl-01-mnemosynes-fall');
     expect(rows[4]?.levelId).toBe('lvl-05-vessels-valv');
-    expect(rows[3]?.levelId).toBe('lvl-04');
-    expect(rows[5]?.levelId).toBe('lvl-06');
+    expect(rows[3]?.levelId).toBe('lvl-04-kolonin-tystnad');
+    expect(rows[5]?.levelId).toBe('lvl-06-glitchskeppet');
     expect(rows.every((r) => r.bestScore === null && r.bestTimeMs === null)).toBe(true);
   });
 

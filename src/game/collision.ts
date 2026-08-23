@@ -144,7 +144,7 @@ function resolveHorizontal(
   return { left: true, right: false };
 }
 
-/** Land on solids or one-way platforms when falling; returns true on landing. */
+/** Land on solids, one-way platforms or solid-phase glitch tiles when falling. */
 function resolveDownward(level: Level, body: PhysicsBody): boolean {
   const bottom = body.y + body.height;
   const footRow = Level.worldToTileY(bottom - COLLISION_EPSILON);
@@ -153,8 +153,7 @@ function resolveDownward(level: Level, body: PhysicsBody): boolean {
   let landed = false;
   let bestSurfaceY = Number.POSITIVE_INFINITY;
   for (let tx = tx0; tx <= tx1; tx++) {
-    const tile = level.tileAt(tx, footRow);
-    if (tile !== TileType.Solid && tile !== TileType.Platform) continue;
+    if (!level.supportsStandingAtTile(tx, footRow)) continue;
     const surfaceY = Level.tileToWorldY(footRow);
     // Only arrest feet that entered this tile band during the step.
     if (bottom >= surfaceY && bottom <= surfaceY + TILE_SIZE + MAX_PENETRATION_PX) {
@@ -195,8 +194,7 @@ export function restingOnSurface(level: Level, body: AABB): boolean {
     body.x + body.width - COLLISION_EPSILON,
   );
   for (let tx = tx0; tx <= tx1; tx++) {
-    const tile = level.tileAt(tx, probeRow);
-    if (tile === TileType.Solid || tile === TileType.Platform) return true;
+    if (level.supportsStandingAtTile(tx, probeRow)) return true;
   }
   return false;
 }

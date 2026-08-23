@@ -60,6 +60,14 @@ const TINT_SOLID_B: Rgba = [0.1, 0.62, 0.95, 1];
 const TINT_PLATFORM: Rgba = [1.0, 0.35, 0.85, 1];
 const TINT_HAZARD: Rgba = [1.0, 0.45, 0.15, 1];
 const GLOW_HAZARD: Rgba = [1.0, 0.45, 0.15, 1.4];
+// Glitch tiles (task C2): hot violet-white while solid, a faint residue when
+// the corruption pulse leaves them "empty".
+const TINT_GLITCH_SOLID: Rgba = [0.75, 0.4, 1.0, 1];
+const TINT_GLITCH_EMPTY: Rgba = [0.55, 0.3, 0.9, 0.14];
+const GLOW_GLITCH: Rgba = [0.75, 0.45, 1.0, 1.6];
+// Level laser grids (task C2) share the boss beam family but read colder.
+const GRID_LASER_COLOR: Rgba = [1, 0.28, 0.42, 1];
+const GRID_LASER_CORE: Rgba = [1, 0.93, 0.97, 1];
 
 const PLAYER_COLOR: Rgba = [0.45, 0.95, 1, 1];
 const PLAYER_CORE_COLOR: Rgba = [1, 1, 1, 1];
@@ -668,6 +676,7 @@ async function boot(): Promise<void> {
 
       if (session) {
         renderer.drawSprites('white', buildWorldSprites(renderer, session, panX, offsetY));
+        drawLevelLaserGrids(renderer, session, panX, offsetY);
         drawBossOverlays(renderer, session, panX, offsetY);
         renderer.drawSprites('white', juice.particles.buildDraws());
         drawDarkness(renderer, session);
@@ -783,6 +792,31 @@ function buildWorldSprites(
               glow: GLOW_HAZARD,
             });
             break;
+          case TileType.Glitch: {
+            // Corruption pulse: solid tiles burn violet; empty ones leave a
+            // faint residue so the bridge can be read in advance.
+            const glitchSolid = level.glitchTilesSolid;
+            sprites.push({
+              x,
+              y: y + (glitchSolid ? 0 : 10),
+              width: TILE_SIZE,
+              height: glitchSolid ? TILE_SIZE : 8,
+              tint: glitchSolid ? TINT_GLITCH_SOLID : TINT_GLITCH_EMPTY,
+              glow: glitchSolid ? GLOW_GLITCH : undefined,
+              blend: glitchSolid ? 'additive' : 'normal',
+            });
+            if (!glitchSolid) {
+              sprites.push({
+                x: x + 4,
+                y: y + 12 + (Math.floor(session.timeMs / 90) % 6),
+                width: TILE_SIZE - 8,
+                height: 2,
+                tint: [TINT_GLITCH_SOLID[0], TINT_GLITCH_SOLID[1], TINT_GLITCH_SOLID[2], 0.35],
+                blend: 'additive',
+              });
+            }
+            break;
+          }
         }
       }
     }
@@ -985,6 +1019,57 @@ const LASER_COLOR: Rgba = [1, 0.35, 0.75, 1];
 const LASER_CORE: Rgba = [1, 0.95, 1, 1];
 const VOID_FILL: Rgba = [0.012, 0.004, 0.03, 0.94];
 const VOID_RIM: Rgba = [0.55, 0.25, 1, 0.5];
+
+/**
+ * Level laser grids (task C2): blinking telegraph lines, then a glowing
+ * beam with a white-hot core while the pulse fires.
+ */
+function drawLevelLaserGrids(
+  renderer: WebGPURenderer,
+  session: GameSession,
+  panX: number,
+  offsetY: number,
+): void {
+  const camY = session.cameraY + offsetY;
+  const draws: SpriteDraw[] = [];
+
+  for (const line of session.telegraphLaserBoxes()) {
+    const blink = 0.35 + 0.45 * Math.abs(Math.sin(session.timeMs / 80));
+    draws.push({
+      x: line.x - panX,
+      y: line.y - camY,
+      width: line.width,
+      height: line.height,
+      tint: [GRID_LASER_COLOR[0], GRID_LASER_COLOR[1], GRID_LASER_COLOR[2], blink],
+      glow: [GRID_LASER_COLOR[0], GRID_LASER_COLOR[1], GRID_LASER_COLOR[2], 1.5],
+      blend: 'additive',
+    });
+  }
+
+  for (const box of session.firingLaserBoxes()) {
+    // Outer glow band + white-hot core line.
+    draws.push({
+      x: box.x - 6 - panX,
+      y: box.y - 6 - camY,
+      width: box.width + 12,
+      height: box.height + 12,
+      tint: [GRID_LASER_COLOR[0], GRID_LASER_COLOR[1], GRID_LASER_COLOR[2], 0.55],
+      glow: [GRID_LASER_COLOR[0], GRID_LASER_COLOR[1], GRID_LASER_COLOR[2], 2.4],
+      blend: 'additive',
+    });
+    draws.push({
+      x: box.x - panX,
+      y: box.y - camY,
+      width: box.width,
+      height: box.height,
+      tint: GRID_LASER_CORE,
+      glow: [1, 1, 1, 2],
+      blend: 'additive',
+    });
+  }
+
+  if (draws.length > 0) renderer.drawSprites('white', draws);
+}
 
 function drawBossOverlays(
   renderer: WebGPURenderer,

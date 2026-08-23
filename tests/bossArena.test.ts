@@ -4,7 +4,7 @@ import {
   playerEntersArena,
   type ArenaBounds,
 } from '../src/game/bosses';
-import { ARENA_TEST_LEVELS, CAMPAIGN_LEVELS, PLAYABLE_LEVELS, getPlayableLevel } from '../src/levels/levels';
+import { CAMPAIGN_LEVELS, PLAYABLE_LEVELS, getLevel } from '../src/levels/levels';
 import { validateLevelData } from '../src/levels/validate';
 import { TILE_SIZE } from '../src/levels/LevelData';
 import { GameSession, STARTING_LIVES, type GameEvent } from '../src/game/GameSession';
@@ -29,7 +29,7 @@ interface RecordedHooks {
 }
 
 function makeSession(levelIndex: number): { session: GameSession; hooks: RecordedHooks } {
-  const data = getPlayableLevel(levelIndex);
+  const data = getLevel(levelIndex);
   if (!data) throw new Error(`no playable level ${levelIndex}`);
   const hooks: RecordedHooks = { events: [], sfx: [] };
   const session = new GameSession({
@@ -60,8 +60,8 @@ function stepFor(session: GameSession, ms: number, input: PlayerInput = idleInpu
   }
 }
 
-const VESSEL_LEVEL = getPlayableLevel(5)!;
-const NULL_LEVEL = getPlayableLevel(7)!;
+const VESSEL_LEVEL = getLevel(5);
+const NULL_LEVEL = getLevel(7);
 const VESSEL_ARENA: ArenaBounds = {
   x: VESSEL_LEVEL.spawns.find((s) => s.kind === 'boss')!.tx0 * TILE_SIZE,
   y: VESSEL_LEVEL.spawns.find((s) => s.kind === 'boss')!.ty0 * TILE_SIZE,
@@ -78,14 +78,13 @@ const VESSEL_ARENA: ArenaBounds = {
 };
 
 describe('arena level data', () => {
-  it('campaign registry is untouched by the boss stand-ins', () => {
-    expect(CAMPAIGN_LEVELS).toHaveLength(3);
-    expect(ARENA_TEST_LEVELS.map((l) => l.index)).toEqual([5, 7]);
-    expect(PLAYABLE_LEVELS.map((l) => l.index)).toEqual([1, 2, 3, 5, 7]);
+  it('the full campaign hosts both boss arenas in their slots (task C2)', () => {
+    expect(CAMPAIGN_LEVELS).toHaveLength(7);
+    expect(PLAYABLE_LEVELS.map((l) => l.index)).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
   it('both boss arenas validate as well-formed levels', () => {
-    for (const data of ARENA_TEST_LEVELS) {
+    for (const data of [VESSEL_LEVEL, NULL_LEVEL]) {
       expect(validateLevelData(data), data.id).toEqual([]);
       const arenas = data.spawns.filter((s) => s.kind === 'boss');
       expect(arenas).toHaveLength(1);

@@ -5,6 +5,7 @@ import {
   SPAWN_CHARS,
   TILE_SIZE,
   TileType,
+  glitchSolidAt,
   type LevelData,
   type LevelSpawn,
 } from './LevelData';
@@ -13,8 +14,16 @@ import {
  * Runtime view over immutable {@link LevelData}: coordinate conversion and
  * tile queries. All conversions operate on world pixels (top-left origin,
  * +Y down) and tile indices.
+ *
+ * Glitch tiles (task C2) are the one mutable wrinkle: the session syncs the
+ * corruption clock each step via {@link syncGlitchTiles} and solidity /
+ * standing queries then answer per {@link glitchSolidAt}. Raw tile data is
+ * never modified — validation, reachability and rendering keep seeing it.
  */
 export class Level {
+  /** Current corruption phase: true while glitch tiles behave as solid. */
+  private glitchPhaseSolid = true;
+
   public constructor(public readonly data: LevelData) {}
 
   public get widthTiles(): number {
@@ -63,6 +72,30 @@ export class Level {
 
   // ------------------------------------------------------------- queries --
 
+  /** Advance the corruption clock (called once per fixed step by GameSession). */
+  public syncGlitchTiles(timeMs: number): void {
+    this.glitchPhaseSolid = glitchSolidAt(timeMs);
+  }
+
+  /** True while glitch tiles currently behave as solid (rendering/debug). */
+  public get glitchTilesSolid(): boolean {
+    return this.glitchPhaseSolid;
+  }
+
+  /** True when the tile blocks movement right now (glitch honors its phase). */
+  public blocksMovementAtTile(tx: number, ty: number): boolean {
+    const tile = this.tileAt(tx, ty);
+    if (tile === TileType.Solid) return true;
+    return tile === TileType.Glitch && this.glitchPhaseSolid;
+  }
+
+  /** True when AURORA could stand on this tile position right now. */
+  public supportsStandingAtTile(tx: number, ty: number): boolean {
+    const tile = this.tileAt(tx, ty);
+    if (tile === TileType.Solid || tile === TileType.Platform) return true;
+    return tile === TileType.Glitch && this.glitchPhaseSolid;
+  }
+
   /**
    * Tile at (tx, ty). Out-of-bounds policy: left/right/below the level is
    * Solid (invisible walls and floor); above the level is open sky.
@@ -79,7 +112,7 @@ export class Level {
 
   /** True for tiles that block movement on all sides. */
   public isSolidAtTile(tx: number, ty: number): boolean {
-    return this.tileAt(tx, ty) === TileType.Solid;
+    return this.blocksMovementAtTile(tx, ty);
   }
 
   /** Convenience: sample solidity at an arbitrary world-space point. */
