@@ -2,8 +2,13 @@
  * HUD (PLAN.md §5 src/ui). `HudState` is the pure data contract between game
  * code and any UI implementation; `DomHud` is a minimal DOM renderer used by
  * main.ts. B0 adds score/lives/weapon/combo readouts, task B5 the level/total
- * time clocks and B1 a juice telemetry line.
+ * time clocks and B1 a juice telemetry line. C1 gates gameplay stats on the
+ * state machine so the readouts only show while a run exists (menu shows
+ * title + hints; pause/game-over/win keep their frozen stats).
  */
+
+/** States in which run statistics (score/lives/weapon/clocks) are shown. */
+const STATS_STATES = new Set(['PLAYING', 'PAUSED', 'GAMEOVER', 'WIN']);
 
 export interface HudState {
   gameStateName: string;
@@ -64,26 +69,31 @@ export class DomHud implements Hud {
   }
 
   private render(state: HudState): void {
+    const statsVisible = STATS_STATES.has(state.gameStateName);
     const parts: string[] = [
       `state: ${state.gameStateName}`,
       `level: ${state.levelName}`,
       `${Math.round(state.fps)} fps`,
     ];
-    if (typeof state.score === 'number') parts.unshift(`SCORE ${formatScore(state.score)}`);
-    if (typeof state.lives === 'number') parts.splice(1, 0, `LIVES ${'◆'.repeat(Math.max(0, state.lives)) || '—'}`);
-    if (state.weapon) parts.push(`WPN ${escapeHtml(state.weapon)}`);
-    if (typeof state.comboMultiplier === 'number' && state.comboMultiplier > 1) {
-      parts.push(`COMBO ×${state.comboMultiplier}`);
-    }
-    if (state.timeText !== null) parts.push(`time: ${state.timeText}`);
-    if (state.totalTimeText !== null) parts.push(`total: ${state.totalTimeText}`);
-    if (typeof state.timeSeconds === 'number') {
-      parts.push(`${state.timeSeconds.toFixed(1)}s`);
+    if (statsVisible) {
+      if (typeof state.score === 'number') parts.unshift(`SCORE ${formatScore(state.score)}`);
+      if (typeof state.lives === 'number') {
+        parts.splice(1, 0, `LIVES ${'◆'.repeat(Math.max(0, state.lives)) || '—'}`);
+      }
+      if (state.weapon) parts.push(`WPN ${escapeHtml(state.weapon)}`);
+      if (typeof state.comboMultiplier === 'number' && state.comboMultiplier > 1) {
+        parts.push(`COMBO ×${state.comboMultiplier}`);
+      }
+      if (state.timeText !== null) parts.push(`time: ${state.timeText}`);
+      if (state.totalTimeText !== null) parts.push(`total: ${state.totalTimeText}`);
+      if (typeof state.timeSeconds === 'number') {
+        parts.push(`${state.timeSeconds.toFixed(1)}s`);
+      }
     }
     let html = `<span class="hud-title">AURORA PROTOCOL</span><span>${parts.join(' · ')}</span>`;
-    if (state.boss) html += renderBossBar(state.boss);
+    if (statsVisible && state.boss) html += renderBossBar(state.boss);
     if (state.message) html += `<span class="hud-message">${escapeHtml(state.message)}</span>`;
-    if (state.juiceLine) html += `<span class="hud-juice">${escapeHtml(state.juiceLine)}</span>`;
+    if (statsVisible && state.juiceLine) html += `<span class="hud-juice">${escapeHtml(state.juiceLine)}</span>`;
     this.root.innerHTML = html;
   }
 
