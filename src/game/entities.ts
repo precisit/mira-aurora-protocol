@@ -75,6 +75,28 @@ export class EntityPool<T extends Entity> {
     return this.items.filter((e) => e.active);
   }
 
+  /**
+   * Live-entity count without allocating a filtered array (hot-path read,
+   * task C3). O(n) over the pool — pools stay small by design.
+   */
+  public get activeCount(): number {
+    let n = 0;
+    for (let i = 0; i < this.items.length; i++) {
+      if (this.items[i]!.active) n += 1;
+    }
+    return n;
+  }
+
+  /**
+   * The backing array itself (never reallocated except by growth). Index
+   * iteration over a cached length lets hot loops avoid both the snapshot
+   * spread (`[...pool.active]`) and the filtered-array allocation; entries
+   * appended mid-loop simply start past the cached length.
+   */
+  public get itemsView(): readonly T[] {
+    return this.items;
+  }
+
   public get size(): number {
     return this.items.length;
   }

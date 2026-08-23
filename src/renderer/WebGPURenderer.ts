@@ -1,4 +1,5 @@
 import { BloomPass, type BloomParams } from './BloomPass';
+import { clampDevicePixelRatio } from '../core/Perf';
 import { SPRITE_SHADER_WGSL } from './shaders';
 import {
   INSTANCE_STRIDE_BYTES,
@@ -128,6 +129,15 @@ export class WebGPURenderer {
   private resizeObserver: ResizeObserver | null = null;
   private uniformBindGroupCache: GPUBindGroup | null = null;
 
+  // Battery-friendly render scale (task C3): the backing store never exceeds
+  // this many CSS pixels per device pixel. Defaults to the plan's 2× cap and
+  // can be lowered at runtime via the persisted `dprCap` setting.
+  private _maxDevicePixelRatio = MAX_DEVICE_PIXEL_RATIO;
+  /** Set once `device.lost` fires; frame calls become graceful no-ops. */
+  private _deviceLost = false;
+  /** User-facing callback for context loss (re-init prompt / clear message). */
+  public onDeviceLost: ((info: GPUDeviceLostInfo) => void) | null = null;
+
   // ------------------------------------------------------------------ init
 
   /**
@@ -171,7 +181,18 @@ export class WebGPURenderer {
     }
     this.device = device;
     device.lost.then((info) => {
+      // Context loss (GPU reset, driver update, tab backgrounding on iOS):
+      // stop touching the dead device and surface a clear message instead of
+      // throwing every frame. Full re-init requires regenerating every
+      // registered texture, so we degrade to the reload fallback.
+      this._deviceLost = true;
       console.error(`[renderer] GPU device lost (${info.reason}): ${info.message}`);
+      this.onDeviceLost?.(info);
+    });
+    // Surface pipeline/programming errors once instead of spamming.
+    device.addEventListener('uncapturederror', (event) => {
+      const gpuEvent = event as GPUUncapturedErrorEvent;
+      console.error('[renderer] uncaptured GPU error:', gpuEvent.error.message);
     });
 
     const context = canvas.getContext('webgpu') as GPUCanvasContext | null;
@@ -323,6 +344,26 @@ export class WebGPURenderer {
 
   // --------------------------------------------------------------- letterbox
 
+  /** Current devicePixelRatio ceiling (battery setting, task C3). */
+  public get maxDevicePixelRatio(): number {
+    return this._maxDevicePixelRatio;
+  }
+
+  /**
+   * Set the backing-store scale ceiling. Values are sanitized: at least 1,
+   * never above the hard {@link MAX_DEVICE_PIXEL_RATIO} cap. Takes effect on
+   * the next `resize()` (a resize observer tick or an explicit call).
+   */
+  public setMaxDevicePixelRatio(cap: number): void {
+    this._maxDevicePixelRatio = clampDevicePixelRatio(cap, cap);
+    this.resize();
+  }
+
+  /** True once the GPU device has been lost; frames degrade to no-ops. */
+  public get isDeviceLost(): boolean {
+    return this._deviceLost;
+  }
+
   /**
    * Recompute backing-store size + letterbox after a canvas resize.
    *
@@ -332,7 +373,11 @@ export class WebGPURenderer {
    * "gutter" where only parallax background is drawn.
    */
   public resize(): void {
-    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DEVICE_PIXEL_RATIO);
+    if (!this.canvas) return;
+    const dpr = clampDevicePixelRatio(
+      window.devicePixelRatio || 1,
+      this._maxDevicePixelRatio,
+    );
     const cssWidth = Math.max(1, this.canvas.clientWidth || window.innerWidth);
     const cssHeight = Math.max(1, this.canvas.clientHeight || window.innerHeight);
 
@@ -416,6 +461,9 @@ export class WebGPURenderer {
 
   /** Begin a frame; clears to `clear` and prepares the sprite pipeline. */
   public beginFrame(clear: Rgba = [0.02, 0.01, 0.07, 1]): void {
+    // After context loss every GPU call is a no-op; the app shows its
+    // "reload" message via onDeviceLost instead of throwing in the loop.
+    if (this._deviceLost) return;
     if (!this.context || !this.batch) throw new WebGPURendererError('beginFrame called before init().');
     if (!this.sceneView) throw new WebGPURendererError('beginFrame called with no scene target.');
 
@@ -463,6 +511,7 @@ export class WebGPURenderer {
    * in endFrame — one instanced draw call per group.
    */
   public drawSprites(textureName: string, sprites: readonly SpriteDraw[]): void {
+    if (this._deviceLost) return;
     if (!this.renderPass) throw new WebGPURendererError('drawSprites called outside begin/endFrame.');
     if (sprites.length === 0) return;
     const queue = this.queuedSprites.get(textureName);
@@ -472,6 +521,8 @@ export class WebGPURenderer {
 
   /** Flush all queued sprite batches, run post-processing, submit, present. */
   public endFrame(): void {
+    // Lost device: nothing was begun this frame — drop out quietly.
+    if (this._deviceLost) return;
     const pass = this.renderPass;
     const encoder = this.commandEncoder;
     const batch = this.batch;
@@ -479,14 +530,32 @@ export class WebGPURenderer {
       throw new WebGPURendererError('endFrame called without beginFrame.');
     }
 
-    this.flushQueuedSprites(pass, batch);
-    pass.end();
+    try {
+      this.flushQueuedSprites(pass, batch);
+      pass.end();
 
-    this.bloomPass?.encode(encoder, this.sceneView, this.getCurrentTextureView());
+      this.bloomPass?.encode(encoder, this.sceneView, this.getCurrentTextureView());
 
-    this.device.queue.submit([encoder.finish()]);
-    this.renderPass = null;
-    this.commandEncoder = null;
+      this.device.queue.submit([encoder.finish()]);
+    } catch (error) {
+      // A present/submit failure usually means the context just died; treat
+      // it like device loss so the loop keeps running without spamming.
+      console.error('[renderer] frame submission failed:', error);
+      this.handleContextLoss();
+    } finally {
+      this.renderPass = null;
+      this.commandEncoder = null;
+    }
+  }
+
+  /** Mark the renderer lost and notify listeners (idempotent). */
+  private handleContextLoss(): void {
+    if (this._deviceLost) return;
+    this._deviceLost = true;
+    this.onDeviceLost?.({
+      reason: 'unknown',
+      message: 'GPU context was lost during rendering.',
+    } as GPUDeviceLostInfo);
   }
 
   /**
@@ -605,6 +674,29 @@ export class WebGPURenderer {
       </p>
       <p><a href="https://webgpureport.org" target="_blank" rel="noopener noreferrer">
         Check your browser's WebGPU support →</a></p>
+    `;
+    target.appendChild(box);
+    target.classList.add('visible');
+  }
+
+  /**
+   * Render the "GPU context lost" page into `host` (task C3 robustness):
+   * shown instead of crashing/spamming when `device.lost` fires mid-session
+   * (GPU reset, driver update, iOS backgrounding). A reload re-initializes.
+   */
+  public static showContextLostMessage(host: HTMLElement | null): void {
+    const target = host ?? document.body;
+    target.innerHTML = '';
+    const box = document.createElement('div');
+    box.className = 'fallback-box';
+    box.innerHTML = `
+      <h1>Graphics session lost</h1>
+      <p>
+        The GPU context was interrupted (device reset, driver update or the app
+        was backgrounded). Your progress up to the last checkpoint is safe in
+        this tab only — reload to continue.
+      </p>
+      <p><button onclick="window.location.reload()">Reload Aurora Protocol</button></p>
     `;
     target.appendChild(box);
     target.classList.add('visible');

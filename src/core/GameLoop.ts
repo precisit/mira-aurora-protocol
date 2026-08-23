@@ -13,13 +13,24 @@
  *
  * A per-frame delta clamp prevents the "spiral of death" after tab switches:
  * huge gaps are simulated for at most MAX_FRAME_TIME_MS of catch-up steps.
+ *
+ * Battery-friendly FPS lock (task C3): with {@link setFpsCap} (e.g. 60 on
+ * mobile) frames arriving sooner than the cap interval skip simulation AND
+ * presentation entirely; their time accrues and is simulated by the next
+ * presented frame, so the 120 Hz logic cadence is preserved while the GPU
+ * only presents at ≤ the locked rate. Uncapped (default) presents every rAF.
  */
+
+import { shouldPresentFrame, type FpsCap } from './Perf';
 
 /** Fixed simulation step, in milliseconds: 1000 / 120 Hz. */
 export const FIXED_STEP_MS = 1000 / 120;
 
 /** Largest frame delta we will ever feed to the accumulator (ms). */
 export const MAX_FRAME_TIME_MS = 250;
+
+/** Frames slower than this are reported via `onLongFrame` (once per stall). */
+export const LONG_FRAME_THRESHOLD_MS = 50;
 
 export interface GameLoopOptions {
   /** Called zero or more times per frame, always with FIXED_STEP_MS. */
@@ -28,6 +39,16 @@ export interface GameLoopOptions {
   render: (alpha: number, frameDeltaMs: number) => void;
   /** Stop running when true is returned from render (optional). */
   shouldQuit?: () => boolean;
+  /**
+   * Battery-friendly present cap (C3). `null`/omitted = present every rAF.
+   * Simulation stays 120 Hz regardless — skipped frames only skip presents.
+   */
+  fpsCap?: FpsCap;
+  /**
+   * Long-frame telemetry (C3): invoked when a rendered frame's delta first
+   * crosses {@link LONG_FRAME_THRESHOLD_MS} (once per sustained stall).
+   */
+  onLongFrame?: (frameDeltaMs: number) => void;
 }
 
 export interface FrameStepResult {
@@ -44,9 +65,14 @@ export class GameLoop {
   private rafId = 0;
   private _running = false;
   private fpsEma = 60;
+  private _fpsCap: FpsCap = null;
+  /** Drift-corrected presentation budget for the FPS lock (ms). */
+  private presentCreditMs = 0;
+  private longFrameActive = false;
 
   public constructor(opts: GameLoopOptions) {
     this.opts = opts;
+    if (opts.fpsCap !== undefined) this._fpsCap = opts.fpsCap;
   }
 
   public get isRunning(): boolean {
@@ -58,10 +84,21 @@ export class GameLoop {
     return this.fpsEma;
   }
 
+  /** Current present cap (null = uncapped); changeable at runtime. */
+  public get fpsCap(): FpsCap {
+    return this._fpsCap;
+  }
+
+  public setFpsCap(cap: FpsCap): void {
+    this._fpsCap = cap;
+  }
+
   public start(now: number = performance.now()): void {
     if (this._running) return;
     this._running = true;
     this.lastTimeMs = now;
+    this.presentCreditMs = 0;
+    this.longFrameActive = false;
     this.rafId = requestAnimationFrame(this.tick);
   }
 
@@ -100,12 +137,32 @@ export class GameLoop {
     if (!this._running) return;
 
     const frameDelta = now - this.lastTimeMs;
+
+    // FPS lock: accumulate a presentation budget and skip simulation AND
+    // presentation for too-early frames. lastTimeMs is intentionally NOT
+    // advanced — skipped time is credited to the next presented frame, so
+    // the 120 Hz logic cadence is preserved (drift-corrected: leftover
+    // budget carries over, keeping e.g. ~60 presents/s on an 80 Hz display).
+    if (this._fpsCap !== null && frameDelta >= 0) {
+      this.presentCreditMs = Math.min(
+        this.presentCreditMs + frameDelta,
+        (1000 / this._fpsCap) * 2,
+      );
+      if (!shouldPresentFrame(this.presentCreditMs, this._fpsCap)) {
+        this.rafId = requestAnimationFrame(this.tick);
+        return;
+      }
+      const interval = 1000 / this._fpsCap;
+      this.presentCreditMs = Math.max(0, this.presentCreditMs - interval);
+    }
+
     this.lastTimeMs = now;
 
     if (frameDelta > 0) {
       // Exponential moving average keeps the FPS readout stable but responsive.
       const instantFps = 1000 / frameDelta;
       this.fpsEma = this.fpsEma * 0.9 + instantFps * 0.1;
+      this.reportFrameTime(frameDelta);
     }
 
     this.processFrame(frameDelta);
@@ -117,4 +174,20 @@ export class GameLoop {
     }
     this.rafId = requestAnimationFrame(this.tick);
   };
+
+  /**
+   * Long-frame telemetry hook. Separated from {@link tick} so tests can feed
+   * deterministic deltas without requestAnimationFrame.
+   */
+  protected reportFrameTime(frameDeltaMs: number): void {
+    const isLong = frameDeltaMs >= LONG_FRAME_THRESHOLD_MS;
+    if (!isLong) {
+      this.longFrameActive = false;
+      return;
+    }
+    // Report only the transition into a stall — sustained slowness logs once.
+    if (this.longFrameActive) return;
+    this.longFrameActive = true;
+    this.opts.onLongFrame?.(frameDeltaMs);
+  }
 }

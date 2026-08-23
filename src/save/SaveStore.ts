@@ -7,6 +7,8 @@
  * degrades to defaults instead of crashing boot.
  */
 
+import { clampDevicePixelRatio, sanitizeFpsCap } from '../core/Perf';
+
 export interface HighscoreEntry {
   score: number;
   timeMs: number;
@@ -19,8 +21,17 @@ export interface GameSettings {
   sfxVolume: number;
   /** Music volume, 0..1. */
   musicVolume: number;
-  /** FPS cap for battery saving on mobile; null = uncapped. */
+  /**
+   * FPS cap for battery saving on mobile; null = uncapped. The simulation
+   * always runs its fixed 120 Hz logic — this only gates presents.
+   */
   fpsCap: number | null;
+  /**
+   * devicePixelRatio ceiling for the backing store (task C3 battery note).
+   * 2 = render at most 2× CSS pixels (PLAN.md §6). Lower values trade
+   * sharpness for fill-rate on high-DPI phones.
+   */
+  dprCap: number;
 }
 
 export interface SaveData {
@@ -47,6 +58,9 @@ export interface StorageLike {
 
 export const SAVE_KEY = 'aurora-protocol.save.v1';
 
+/** Battery-friendly default render scale: at most 2× CSS pixels. */
+export const DEFAULT_DPR_CAP = 2;
+
 export function defaultSaveData(): SaveData {
   return {
     version: 1,
@@ -54,7 +68,13 @@ export function defaultSaveData(): SaveData {
     totalScore: 0,
     bestRunTimeMs: null,
     unlockedWeapons: ['puls'], // starting weapon
-    settings: { volume: 0.8, sfxVolume: 0.9, musicVolume: 0.7, fpsCap: null },
+    settings: {
+      volume: 0.8,
+      sfxVolume: 0.9,
+      musicVolume: 0.7,
+      fpsCap: null,
+      dprCap: DEFAULT_DPR_CAP,
+    },
   };
 }
 
@@ -176,8 +196,12 @@ export class SaveStore {
             : fallback.settings.musicVolume,
         fpsCap:
           typeof parsed.settings?.fpsCap === 'number' || parsed.settings?.fpsCap === null
-            ? (parsed.settings.fpsCap as number | null)
+            ? sanitizeFpsCap(parsed.settings.fpsCap)
             : fallback.settings.fpsCap,
+        dprCap:
+          typeof parsed.settings?.dprCap === 'number'
+            ? clampDevicePixelRatio(parsed.settings.dprCap, parsed.settings.dprCap)
+            : fallback.settings.dprCap,
       },
     };
   }

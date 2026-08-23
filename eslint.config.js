@@ -24,4 +24,13 @@ export default tseslint.config(
       // Style preference: prefer explicit `import type` (enforced by tsc too).
     },
   },
+  {
+    // CI helper scripts run under Node.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: {
+        ...globals.node,
+      },
+    },
+  },
 );
