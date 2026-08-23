@@ -13,6 +13,7 @@ import {
   type SpriteDraw,
 } from './renderer/WebGPURenderer';
 import { DomHud } from './ui/Hud';
+import { SaveStore } from './save/SaveStore';
 import './style.css';
 
 /**
@@ -63,17 +64,13 @@ async function boot(): Promise<void> {
   const level = new Level(createTestLevel());
   const input = new InputManager();
   input.attach(window);
+  const save = new SaveStore();
   const audio = new AudioEngine();
+  audio.applySettings(save.load().settings); // persisted volumes (SaveStore hook)
+  const detachAudioUnlock = audio.initOnInteraction(window, () => audio.playSfx('ui-click'));
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
   const state = new GameStateMachine();
   state.transition(GameStateName.Menu); // assets are ready → show menu
-
-  // Audio must unlock on the first user gesture (autoplay policy).
-  const unlockAudio = (): void => {
-    void audio.unlock().then(() => audio.playSfx('ui-click'));
-  };
-  window.addEventListener('keydown', unlockAudio, { once: true });
-  window.addEventListener('pointerdown', unlockAudio, { once: true });
 
   const demo: DemoState = { cameraX: 0, cameraDir: 1 };
 
@@ -145,15 +142,19 @@ async function boot(): Promise<void> {
       ) {
         state.transition(GameStateName.Playing);
         audio.playSfx('checkpoint');
+        // Per-level track; warns once and stays silent until Fas 5 adds mp3s.
+        void audio.playMusic(level.data.id);
       }
       if (
         state.current === GameStateName.Paused &&
         (input.wasPressed(InputAction.Pause) || input.wasPressed(InputAction.Confirm))
       ) {
         state.transition(GameStateName.Playing);
+        audio.resumeMusic();
       }
       if (state.current === GameStateName.Playing && input.wasPressed(InputAction.Pause)) {
         state.transition(GameStateName.Paused);
+        audio.pauseMusic();
       }
 
       // Auto-pan the camera while playing (ping-pong across the level).
@@ -191,6 +192,7 @@ async function boot(): Promise<void> {
   window.addEventListener('beforeunload', () => {
     loop.stop();
     input.detach();
+    detachAudioUnlock();
     audio.dispose();
     hud.destroy();
   });

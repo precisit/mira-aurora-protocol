@@ -15,6 +15,10 @@ export interface HighscoreEntry {
 export interface GameSettings {
   /** Master volume, 0..1. */
   volume: number;
+  /** SFX bus volume, 0..1. */
+  sfxVolume: number;
+  /** Music volume, 0..1. */
+  musicVolume: number;
   /** FPS cap for battery saving on mobile; null = uncapped. */
   fpsCap: number | null;
 }
@@ -43,7 +47,7 @@ export function defaultSaveData(): SaveData {
     highscores: {},
     totalScore: 0,
     unlockedWeapons: ['puls'], // starting weapon
-    settings: { volume: 0.8, fpsCap: null },
+    settings: { volume: 0.8, sfxVolume: 0.9, musicVolume: 0.7, fpsCap: null },
   };
 }
 
@@ -138,6 +142,14 @@ export class SaveStore {
           typeof parsed.settings?.volume === 'number'
             ? Math.min(1, Math.max(0, parsed.settings.volume))
             : fallback.settings.volume,
+        sfxVolume:
+          typeof parsed.settings?.sfxVolume === 'number'
+            ? Math.min(1, Math.max(0, parsed.settings.sfxVolume))
+            : fallback.settings.sfxVolume,
+        musicVolume:
+          typeof parsed.settings?.musicVolume === 'number'
+            ? Math.min(1, Math.max(0, parsed.settings.musicVolume))
+            : fallback.settings.musicVolume,
         fpsCap:
           typeof parsed.settings?.fpsCap === 'number' || parsed.settings?.fpsCap === null
             ? (parsed.settings.fpsCap as number | null)
