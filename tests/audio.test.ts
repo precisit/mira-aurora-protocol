@@ -310,6 +310,7 @@ describe('AudioEngine — procedural SFX synthesis (headless)', () => {
         'boss-warning',
         'ui-click',
         'combo-tick',
+        'intro-sting',
       ].sort(),
     );
 

@@ -14,6 +14,7 @@ import {
   type SpriteDraw,
 } from './renderer/WebGPURenderer';
 import { DomHud } from './ui/Hud';
+import { IntroSequence } from './ui/IntroSequence';
 import { SaveStore } from './save/SaveStore';
 import { newlyUnlockedWeapons } from './save/unlocks';
 import { WEAPONS } from './game/weapons';
@@ -38,6 +39,10 @@ import './style.css';
  * PLAYING … → WIN → MENU. Camera follows AURORA; HUD shows score/lives/
  * weapon/combo plus the B5 level/total clocks and the B1 juice telemetry;
  * procedural SFX fire on gameplay events.
+ *
+ * On first boot the skippable B4 intro cinematic plays during BOOT before
+ * MENU (once per page session; any key/tap skips straight to the menu and
+ * the HUD stays hidden until gameplay begins).
  *
  * B1 juice (PLAN.md §4 "Juice & effekter") routes through {@link JuiceSystem},
  * the shared effects façade: jump/land/shoot are observed from the player
@@ -110,17 +115,39 @@ async function boot(): Promise<void> {
   let saveData = save.load();
   save.save(saveData);
   const audio = new AudioEngine();
-  audio.applySettings(saveData.settings);
-  const detachAudioUnlock = audio.initOnInteraction(window, () => audio.playSfx('ui-click'));
-
+  audio.applySettings(saveData.settings); // persisted volumes (SaveStore hook)
+  const detachAudioUnlock = audio.initOnInteraction(window, () => {
+    // First user interaction unlocks WebAudio; greet with the intro sting
+    // while the cinematic is still running, otherwise the usual UI click.
+    const inIntro = intro !== null && !intro.playback.finished;
+    audio.playSfx(inIntro ? 'intro-sting' : 'ui-click');
+  });
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
+  const hudRoot = document.getElementById('hud-root');
   const state = new GameStateMachine();
   // Task B5: level + total run clocks, kept in sync with the state machine
   // (MENU→PLAYING starts the run, PAUSED pauses, GAMEOVER restarts the level
   // clock while total keeps accumulating — speedrun rules per PLAN.md §4).
   const timer = new LevelTimer();
   const detachTimerSync = attachLevelTimer(state, timer);
-  state.transition(GameStateName.Menu);
+
+  // ---- B4 intro (skippable, once per page session) ------------------------
+  let intro: IntroSequence | null = null;
+  if (IntroSequence.shouldPlay()) {
+    IntroSequence.markPlayed();
+    intro = new IntroSequence(renderer, {
+      parallax,
+      onFinish: () => {
+        input.endFrame(); // the skip keypress must not also start the game
+        if (state.current === GameStateName.Boot) state.transition(GameStateName.Menu);
+      },
+    });
+    intro.start();
+    intro.attach(window); // any key / tap / click skips
+    audio.playSfx('intro-sting'); // silent until audio unlocks; guarded
+  } else {
+    state.transition(GameStateName.Menu); // assets are ready → show menu
+  }
 
   // ---- B1 juice -------------------------------------------------------------
   const juice = new JuiceSystem({
@@ -395,6 +422,16 @@ async function boot(): Promise<void> {
   // ---- Fixed-timestep loop --------------------------------------------------
   const loop = new GameLoop({
     update(stepMs) {
+      // Intro owns BOOT: advance it, and swallow the frame that ends it so a
+      // skip keypress never leaks into the menu's "press SPACE to start".
+      if (intro && state.current === GameStateName.Boot) {
+        intro.update(stepMs / 1000);
+        if (intro.playback.finished) {
+          input.endFrame();
+          return;
+        }
+      }
+
       // Clocks only accumulate while PLAYING (timer guards internally).
       timer.advance(stepMs);
 
@@ -476,6 +513,17 @@ async function boot(): Promise<void> {
     render() {
       refreshLatches();
 
+      // B4 intro owns BOOT: draw the cinematic over black and keep the HUD
+      // hidden until the menu/gameplay UI takes over.
+      const introActive = state.current === GameStateName.Boot && intro !== null;
+      if (introActive) {
+        renderer.beginFrame([0, 0, 0, 1]);
+        (intro as IntroSequence).render();
+        renderer.endFrame();
+        if (hudRoot) hudRoot.style.display = 'none';
+        return;
+      }
+
       // B1 screen shake rides the camera transform: everything world-space
       // (parallax pan + tiles/entities) shifts by the trauma noise; the DOM
       // HUD stays steady.
@@ -493,6 +541,7 @@ async function boot(): Promise<void> {
       drawScreenFlash();
       renderer.endFrame();
 
+      if (hudRoot) hudRoot.style.display = '';
       hud.update({
         gameStateName: state.current,
         levelName: session?.level.data.name ?? '—',
@@ -536,6 +585,7 @@ async function boot(): Promise<void> {
     detachTouchUi();
     detachAudioUnlock();
     detachTimerSync();
+    intro?.dispose();
     audio.dispose();
     hud.destroy();
   });
