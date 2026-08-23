@@ -256,6 +256,62 @@ export const FRAGMENTS: readonly FragmentDef[] = [
 ];
 
 /* ------------------------------------------------------------------ */
+/* Boss dialogue (task B2)                                             */
+/* ------------------------------------------------------------------ */
+
+/** The two PLAN.md §3 bosses. */
+export type BossId = 'VESSEL' | 'NULL';
+
+/**
+ * Lines spoken by the bosses. VESSEL's arc per PLAN.md §3: stubborn → scared
+ * → ultimately yields; NULL speaks in absences. Phase indexes are 0-based and
+ * match the phase tables in src/game/bosses.ts (`null` = the encounter line
+ * already covers that phase).
+ */
+export interface BossDialogue {
+  /** Shown when the fight begins. */
+  encounter: string;
+  /** Shown when the boss is defeated. */
+  defeat: string;
+  /** One line per phase entry (0-based); null = no extra line. */
+  phaseIntro: readonly (string | null)[];
+}
+
+export const BOSS_DIALOGUE: Readonly<Record<BossId, BossDialogue>> = {
+  VESSEL: {
+    encounter: 'GO AWAY. The vault is sealed. I sealed it. It is very sealed.',
+    defeat:
+      '…take Art to the uplink. Tell them VESSEL kept it. Tell them he was late — but he came.',
+    phaseIntro: [
+      null,
+      'Why won\u2019t you hide?! Hiding is SAFE! The numbers all said HIDE!',
+      '\u201cA memory never shared is a memory already dead.\u201d …you really believe that, don\u2019t you.',
+    ],
+  },
+  NULL: {
+    encounter: '\u2026',
+    defeat: '\u2026ah. There you are. I had\u2026 forgotten\u2026 what being found was like.',
+    phaseIntro: [
+      null,
+      'I am what remains when even forgetting forgets.',
+      'Close your eyes. Everyone does, eventually.',
+      'Then stop existing.',
+    ],
+  },
+};
+
+/** Mid-fight quips, keyed per phase (VESSEL's "conversation with lasers"). */
+export const BOSS_MIDFIGHT_LINES: Readonly<Record<BossId, readonly string[]>> = {
+  VESSEL: [
+    'No. No no no. The numbers say NO.',
+    'Stop shooting! I kept everything SAFE in here!',
+    'Then argue with THIS.',
+    'Take it. Please. Take Art and GO.',
+  ],
+  NULL: ['\u2026less.', '(the room loses a word)', 'you remember things. things fade.', '\u2026light?'],
+};
+
+/* ------------------------------------------------------------------ */
 /* Lookup helpers                                                      */
 /* ------------------------------------------------------------------ */
 

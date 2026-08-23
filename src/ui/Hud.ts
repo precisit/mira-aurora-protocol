@@ -28,6 +28,8 @@ export interface HudState {
   timeSeconds?: number;
   /** B1 "juice" telemetry line (particles/shake/bloom); null hides it. */
   juiceLine?: string | null;
+  /** Boss fight readout (task B2); null/absent hides the bar. */
+  boss?: { name: string; hpFraction: number; phase: number; phaseCount: number } | null;
 }
 
 export interface Hud {
@@ -79,6 +81,7 @@ export class DomHud implements Hud {
       parts.push(`${state.timeSeconds.toFixed(1)}s`);
     }
     let html = `<span class="hud-title">AURORA PROTOCOL</span><span>${parts.join(' · ')}</span>`;
+    if (state.boss) html += renderBossBar(state.boss);
     if (state.message) html += `<span class="hud-message">${escapeHtml(state.message)}</span>`;
     if (state.juiceLine) html += `<span class="hud-juice">${escapeHtml(state.juiceLine)}</span>`;
     this.root.innerHTML = html;
@@ -88,6 +91,25 @@ export class DomHud implements Hud {
     this.root.remove();
   }
 }
+
+/** Boss name + segmented HP bar + phase pips (task B2). */
+function renderBossBar(boss: NonNullable<HudState['boss']>): string {
+  const fraction = Math.min(1, Math.max(0, boss.hpFraction));
+  const segments = Math.max(1, Math.round(fraction * SEGMENT_COUNT));
+  const bar = '▮'.repeat(segments) + '▯'.repeat(Math.max(0, SEGMENT_COUNT - segments));
+  const phasePips =
+    Array.from({ length: boss.phaseCount }, (_, i) => (i < boss.phase ? '◆' : '◇')).join('');
+  return (
+    `<span class="hud-boss">` +
+    `${escapeHtml(boss.name)} ` +
+    `<span class="hud-boss-bar">${bar}</span> ` +
+    `${Math.round(fraction * 100)}% ` +
+    `<span class="hud-boss-phase">${phasePips} ${boss.phase}/${boss.phaseCount}</span>` +
+    `</span>`
+  );
+}
+
+const SEGMENT_COUNT = 20;
 
 function formatScore(score: number): string {
   return Math.max(0, Math.round(score)).toString().padStart(6, '0');

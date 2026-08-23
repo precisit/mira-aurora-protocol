@@ -20,6 +20,11 @@ export interface Projectile extends Entity {
   damage: number;
   /** Remaining lifetime in seconds. */
   lifeSeconds: number;
+  /**
+   * NULL's "absence" shots (task B2): erase other sprites they touch and
+   * render as void shards instead of glowing bolts.
+   */
+  eraser: boolean;
 }
 
 export function createProjectile(id: number): Projectile {
@@ -32,6 +37,7 @@ export function createProjectile(id: number): Projectile {
     owner: 'player',
     damage: 1,
     lifeSeconds: 0,
+    eraser: false,
   };
 }
 
@@ -101,6 +107,7 @@ export function launchProjectile(
   projectile.owner = owner;
   projectile.damage = Math.max(1, Math.round(damage));
   projectile.lifeSeconds = Math.max(0.05, lifetimeSeconds);
+  projectile.eraser = false;
   projectile.size.x = PROJECTILE_WIDTH;
   projectile.size.y = PROJECTILE_HEIGHT;
   projectile.position.x = origin.x - projectile.size.x / 2;

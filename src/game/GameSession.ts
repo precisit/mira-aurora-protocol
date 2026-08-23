@@ -5,6 +5,7 @@ import {
   launchProjectile,
   updateProjectile,
   projectileOverlaps,
+  projectileBox,
   type Projectile,
 } from './Projectile';
 import {
@@ -30,6 +31,19 @@ import {
   type FragmentTypeName,
   type PowerupTypeName,
 } from './entities';
+import {
+  BossEntity,
+  cameraClampForArena,
+  createBoss,
+  playerEntersArena,
+  pointInVoid,
+  arenaFromTiles,
+  type ArenaBounds,
+  type BossHudInfo,
+  type BossId,
+  type BossShotRequest,
+  type BossStepResult,
+} from './bosses';
 import { Level } from '../levels/Level';
 import type { LevelData } from '../levels/LevelData';
 import { SeededRng } from '../core/Rng';
@@ -59,6 +73,13 @@ export const MAX_LIVES = 9;
 const ENEMY_PROJECTILE_SPEED_PX_PER_S = 320;
 const ENEMY_PROJECTILE_LIFETIME_S = 2.2;
 
+/** Boss hover anchor height above the arena's top edge (task B2). */
+const BOSS_HOVER_ANCHOR_Y_PX = 120;
+/** Seconds between fragment bursts during a boss death sequence. */
+const BOSS_DEATH_BURST_INTERVAL_S = 0.28;
+/** Speed of shots VESSEL's mirror bounces back at AURORA. */
+const REFLECTED_SHOT_SPEED_PX_PER_S = 380;
+
 const MAGNET_RADIUS_PX = 220;
 const MAGNET_PULL_PX_PER_S = 460;
 
@@ -80,7 +101,12 @@ export type GameEvent =
   | { type: 'respawned'; atCheckpoint: boolean }
   | { type: 'level-restarted' }
   | { type: 'game-over' }
-  | { type: 'level-complete' };
+  | { type: 'level-complete' }
+  /** Boss fight armed as AURORA stepped into the arena (task B2). */
+  | { type: 'boss-encountered'; boss: BossId }
+  | { type: 'boss-phase-changed'; boss: BossId; phase: number; quote: string | null }
+  | { type: 'boss-quote'; boss: BossId; text: string }
+  | { type: 'boss-defeated'; boss: BossId; points: number };
 
 export interface SessionHooks {
   /** Procedural SFX sink (defaults to silence — tests stay quiet). */
@@ -117,6 +143,14 @@ export class GameSession {
   private readonly pickups: Pickup[] = [];
   private readonly checkpointList: CheckpointState[] = [];
   private exitBox: AABB | null = null;
+
+  /** Boss arena parsed from level data (task B2); null in plain levels. */
+  private arenaSpawn: Extract<LevelData['spawns'][number], { kind: 'boss' }> | null = null;
+  private _bossArena: ArenaBounds | null = null;
+  private _boss: BossEntity | null = null;
+  private bossEngaged = false;
+  private bossDefeatHandled = false;
+  private bossBurstCountdownSeconds = 0;
 
   private _lives = STARTING_LIVES;
   private _status: SessionStatus = 'playing';
@@ -205,6 +239,34 @@ export class GameSession {
     return this.checkpointList.filter((c) => c.activated).length;
   }
 
+  // ------------------------------------------------------- boss queries --
+
+  /** Live boss once the arena has been triggered; null before/after reset. */
+  public get boss(): BossEntity | null {
+    return this._boss;
+  }
+
+  /** World-px arena bounds from level data, or null. */
+  public get bossArena(): ArenaBounds | null {
+    return this._bossArena;
+  }
+
+  /** True between trigger and defeat (camera lock + exit seal window). */
+  public get bossFightActive(): boolean {
+    return this._boss !== null && !this._boss.isDefeated;
+  }
+
+  /** 0..1 renderer overlay for NULL's darkness waves. */
+  public get darknessLevel(): number {
+    return this._boss?.darknessLevel ?? 0;
+  }
+
+  /** HUD contract for the boss HP bar, or null while no fight is running. */
+  public getBossHud(): BossHudInfo | null {
+    if (!this._boss || !this.bossEngaged || this._boss.isDefeated) return null;
+    return this._boss.hudInfo();
+  }
+
   // -------------------------------------------------------------- update --
 
   /** Advance the simulation one fixed step (`stepMs` from GameLoop). */
@@ -222,6 +284,8 @@ export class GameSession {
     }
 
     this.handleShooting(input);
+    this.updateBossFight(dtSeconds);
+    if (this._status !== 'playing') return;
     this.updateEnemies(dtSeconds);
     this.updateProjectiles(dtSeconds);
     this.updatePickups(dtSeconds);
@@ -272,6 +336,14 @@ export class GameSession {
     for (const item of this.projectiles.active) item.active = false;
     this.particles.clear();
 
+    // Boss state re-arms with the world (attempt restarts reset the fight).
+    this.arenaSpawn = null;
+    this._bossArena = null;
+    this._boss = null;
+    this.bossEngaged = false;
+    this.bossDefeatHandled = false;
+    this.bossBurstCountdownSeconds = 0;
+
     for (const spawn of this.level.data.spawns) {
       switch (spawn.kind) {
         case 'enemy': {
@@ -297,6 +369,14 @@ export class GameSession {
           };
           break;
         }
+        case 'boss':
+          // Arm the boss room (task B2): the encounter triggers when the
+          // player walks in — see updateBossFight.
+          if (!this.arenaSpawn) {
+            this.arenaSpawn = spawn;
+            this._bossArena = arenaFromTiles(spawn.tx0, spawn.ty0, spawn.tx1, spawn.ty1);
+          }
+          break;
         default:
           break;
       }
@@ -344,6 +424,154 @@ export class GameSession {
     this.hooks.sfx?.('shoot');
   }
 
+  // ---------------------------------------------------------------- boss --
+
+  /**
+   * Boss encounter lifecycle (task B2): arm on arena entry, step the boss,
+   * realize its shots/quotes, then apply its hazards — firing lasers, erasure
+   * voids (instant, like hazards) and contact damage.
+   */
+  private updateBossFight(dtSeconds: number): void {
+    if (!this._bossArena || !this.arenaSpawn) return;
+    if (!this._boss) {
+      if (
+        !this.bossEngaged &&
+        playerEntersArena(this.playerEntersCenter(), this._bossArena)
+      ) {
+        this.engageBoss();
+      }
+      return;
+    }
+
+    const boss = this._boss;
+    const result: BossStepResult = boss.step({
+      level: this.level,
+      arena: this._bossArena,
+      playerCenter: { x: this.player.centerX, y: this.player.centerY },
+      dtSeconds,
+      rng: () => this.rng.next(),
+    });
+
+    for (const quote of result.quotes) {
+      this.hooks.onEvent?.({ type: 'boss-quote', boss: boss.bossId, text: quote });
+    }
+    if (result.phaseChanged) {
+      this.hooks.sfx?.('boss-warning');
+      this.hooks.onEvent?.({
+        type: 'boss-phase-changed',
+        boss: boss.bossId,
+        phase: boss.phaseIndex + 1,
+        quote: result.phaseIntroLine,
+      });
+    }
+    for (const shotRequest of result.shots) this.spawnBossShot(shotRequest);
+
+    if (boss.state === 'dying') this.updateDeathSequence(dtSeconds);
+    if (boss.state === 'dead' && !this.bossDefeatHandled) this.completeBossDefeat(boss);
+    if (this._status !== 'playing') return;
+
+    // Firing lasers hurt like any hit (i-frames respected).
+    if (!this.player.isInvulnerable) {
+      for (const beamBox of boss.activeLaserBoxes()) {
+        if (this.overlapsPlayer(beamBox)) {
+          this.damagePlayer();
+          break;
+        }
+      }
+    }
+    if (this._status !== 'playing') return;
+
+    // Voids are absence, not attacks: they erase outright (hazard rules).
+    for (const zone of boss.hazardCircles()) {
+      if (pointInVoid(this.player.centerX, this.player.centerY, zone)) {
+        this.killPlayer();
+        return;
+      }
+    }
+
+    // Contact damage off the boss body.
+    if (!this.player.isInvulnerable && this.overlapsPlayer(boss.bodyBox())) {
+      this.damagePlayer();
+    }
+  }
+
+  private playerEntersCenter(): { x: number; y: number } {
+    return { x: this.player.centerX, y: this.player.centerY };
+  }
+
+  private engageBoss(): void {
+    const arena = this._bossArena;
+    const spawn = this.arenaSpawn;
+    if (!arena || !spawn) return;
+    this.bossEngaged = true;
+    this._boss = createBoss(spawn.boss, {
+      x: arena.x + arena.width / 2,
+      y: arena.y + BOSS_HOVER_ANCHOR_Y_PX,
+    });
+    this.hooks.sfx?.('boss-warning');
+    this.hooks.onEvent?.({ type: 'boss-encountered', boss: spawn.boss });
+  }
+
+  private spawnBossShot(request: BossShotRequest): void {
+    const shot = this.projectiles.spawn();
+    launchProjectile(
+      shot,
+      'enemy',
+      request.origin,
+      request.direction,
+      request.speedPxPerS,
+      request.damage,
+      request.lifetimeSeconds,
+    );
+    shot.eraser = request.eraser === true;
+    this.hooks.sfx?.('shoot');
+  }
+
+  /** Fragment bursts across the boss while it dies (death sequence juice). */
+  private updateDeathSequence(dtSeconds: number): void {
+    const boss = this._boss;
+    if (!boss) return;
+    this.bossBurstCountdownSeconds -= dtSeconds;
+    if (this.bossBurstCountdownSeconds > 0) return;
+    this.bossBurstCountdownSeconds = BOSS_DEATH_BURST_INTERVAL_S;
+    const box = boss.bodyBox();
+    const angle = this.rng.next() * Math.PI * 2;
+    const radius = this.rng.next() * Math.min(box.width, box.height) * 0.45;
+    this.particles.emit({
+      x: box.x + box.width / 2 + Math.cos(angle) * radius,
+      y: box.y + box.height / 2 + Math.sin(angle) * radius,
+      count: 14,
+      speedMin: 60,
+      speedMax: 240,
+      lifeSeconds: 0.5,
+      sizePx: 5,
+      gravityScale: 0.5,
+      color: [1, 0.95, 0.7, 1],
+    });
+  }
+
+  /** Boss down: reward points, clear the arena, free the exit. */
+  private completeBossDefeat(boss: BossEntity): void {
+    this.bossDefeatHandled = true;
+    const points = this.score.award(boss.killScore, this._timeMs, { kind: 'kill' });
+    const center = boss.center();
+    for (let ring = 0; ring < 3; ring++) {
+      this.particles.emit({
+        x: center.x,
+        y: center.y,
+        count: 18,
+        speedMin: 80 + ring * 90,
+        speedMax: 260 + ring * 120,
+        lifeSeconds: 0.6 + ring * 0.2,
+        sizePx: 6 - ring,
+        gravityScale: 0.4,
+        color: ring === 0 ? [1, 1, 1, 1] : [1, 0.8, 0.35, 1],
+      });
+    }
+    this.hooks.sfx?.('checkpoint');
+    this.hooks.onEvent?.({ type: 'boss-defeated', boss: boss.bossId, points });
+  }
+
   // ---------------------------------------------------------- projectiles --
 
   private updateProjectiles(dtSeconds: number): void {
@@ -358,12 +586,31 @@ export class GameSession {
 
       if (projectile.owner === 'player') {
         this.resolvePlayerShot(projectile);
-      } else if (projectileOverlaps(projectile, playerBox(this.player))) {
-        deactivateProjectile(projectile);
-        this.emitImpactSparks(projectile);
-        this.damagePlayer();
+      } else {
+        // Erasing shots (NULL) delete player shots they touch — absence eats
+        // light. Otherwise enemy bolts hurt AURORA as usual.
+        if (projectile.eraser && this.erasePlayerShots(projectile)) continue;
+        if (projectileOverlaps(projectile, playerBox(this.player))) {
+          deactivateProjectile(projectile);
+          this.emitImpactSparks(projectile);
+          this.damagePlayer();
+        }
       }
     }
+  }
+
+  /** Deactivate every player shot overlapping `eraser`; true if any were. */
+  private erasePlayerShots(eraser: Projectile): boolean {
+    let erased = false;
+    for (const other of [...this.projectiles.active]) {
+      if (!other.active || other.owner !== 'player') continue;
+      if (!projectileOverlaps(eraser, projectileBox(other))) continue;
+      deactivateProjectile(other);
+      this.emitImpactSparks(other);
+      erased = true;
+    }
+    if (erased) deactivateProjectile(eraser);
+    return erased;
   }
 
   private resolvePlayerShot(projectile: Projectile): void {
@@ -387,6 +634,36 @@ export class GameSession {
       this.hooks.sfx?.('pickup');
       this.hooks.onEvent?.({ type: 'enemy-killed', kind: enemy.kind });
       return;
+    }
+
+    // Boss damage path (task B2): same overlap + damage flow as enemies.
+    const boss = this._boss;
+    if (
+      projectile.active &&
+      boss &&
+      boss.active &&
+      projectileOverlaps(projectile, boss.bodyBox())
+    ) {
+      deactivateProjectile(projectile);
+      this.emitImpactSparks(projectile);
+      const outcome = boss.takeHit(projectile.damage, () => this.rng.next());
+      if (outcome === 'reflected') {
+        // Mirror shell: the shot returns at AURORA as an enemy bolt.
+        const back = aimDirection(boss.center(), this.playerEntersCenter());
+        const returning = this.projectiles.spawn();
+        launchProjectile(
+          returning,
+          'enemy',
+          { x: boss.center().x + back.x * 20, y: boss.center().y + back.y * 20 },
+          back,
+          REFLECTED_SHOT_SPEED_PX_PER_S,
+          1,
+          ENEMY_PROJECTILE_LIFETIME_S,
+        );
+        this.hooks.sfx?.('shoot');
+      } else if (outcome === 'hit') {
+        this.hooks.sfx?.('combo-tick', { step: 1 });
+      }
     }
   }
 
@@ -491,7 +768,10 @@ export class GameSession {
       this.hooks.onEvent?.({ type: 'checkpoint-activated', index });
     });
 
-    if (this.exitBox && aabbOverlap(playerBox(this.player), this.exitBox)) {
+    // The exit stays sealed while a boss stands (task B2): no skipping the
+    // fight by touching the door behind it.
+    const exitSealed = this.bossFightActive;
+    if (!exitSealed && this.exitBox && aabbOverlap(playerBox(this.player), this.exitBox)) {
       this._status = 'levelComplete';
       this.hooks.sfx?.('checkpoint');
       this.hooks.onEvent?.({ type: 'level-complete' });
@@ -567,26 +847,44 @@ export class GameSession {
 
   // --------------------------------------------------------------- camera --
 
-  private snapCamera(): void {
-    this._cameraX = clampCamera(
-      this.player.centerX - VIRTUAL_WIDTH / 2,
-      this.level.pixelWidth - VIRTUAL_WIDTH,
-    );
-    this._cameraY = clampCamera(
-      this.player.centerY - VIRTUAL_HEIGHT / 2,
-      this.level.pixelHeight - VIRTUAL_HEIGHT,
+  /** Arena-derived clamps while a fight runs; null frees the camera. */
+  private arenaCameraClamps() {
+    if (!this.bossFightActive || !this._bossArena) return null;
+    return cameraClampForArena(
+      this._bossArena,
+      VIRTUAL_WIDTH,
+      VIRTUAL_HEIGHT,
+      this.level.pixelWidth,
+      this.level.pixelHeight,
     );
   }
 
-  private followCamera(dtSeconds: number): void {
-    const targetX = clampCamera(
+  private snapCamera(): void {
+    const clamps = this.arenaCameraClamps();
+    const baseX = clampCamera(
       this.player.centerX - VIRTUAL_WIDTH / 2,
       this.level.pixelWidth - VIRTUAL_WIDTH,
     );
-    const targetY = clampCamera(
+    const baseY = clampCamera(
       this.player.centerY - VIRTUAL_HEIGHT / 2,
       this.level.pixelHeight - VIRTUAL_HEIGHT,
     );
+    this._cameraX = clampInto(baseX, clamps?.minX ?? null, clamps?.maxX ?? null);
+    this._cameraY = clampInto(baseY, clamps?.minY ?? null, clamps?.maxY ?? null);
+  }
+
+  private followCamera(dtSeconds: number): void {
+    const clamps = this.arenaCameraClamps();
+    let targetX = clampCamera(
+      this.player.centerX - VIRTUAL_WIDTH / 2,
+      this.level.pixelWidth - VIRTUAL_WIDTH,
+    );
+    let targetY = clampCamera(
+      this.player.centerY - VIRTUAL_HEIGHT / 2,
+      this.level.pixelHeight - VIRTUAL_HEIGHT,
+    );
+    targetX = clampInto(targetX, clamps?.minX ?? null, clamps?.maxX ?? null);
+    targetY = clampInto(targetY, clamps?.minY ?? null, clamps?.maxY ?? null);
     const t = Math.min(1, CAMERA_FOLLOW_RATE * dtSeconds);
     this._cameraX += (targetX - this._cameraX) * t;
     this._cameraY += (targetY - this._cameraY) * t;
@@ -644,6 +942,14 @@ function clampCamera(value: number, max: number): number {
   const upper = Math.max(0, max);
   if (!Number.isFinite(value)) return 0;
   return Math.min(Math.max(0, value), upper);
+}
+
+/** Constrain `value` into [lo, hi] when either bound is provided. */
+function clampInto(value: number, lo: number | null, hi: number | null): number {
+  let result = value;
+  if (lo !== null && result < lo) result = lo;
+  if (hi !== null && result > hi) result = hi;
+  return result;
 }
 
 function playerBox(player: Player): AABB {
