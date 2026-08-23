@@ -1,116 +1,311 @@
 /**
- * Audio engine skeleton (PLAN.md §6 "Ljud").
+ * Audio engine (PLAN.md §6 "Ljud").
  *
- * Fas 0 ships a *working* procedural SFX path (WebAudio oscillators + gain
- * envelopes) and the lifecycle plumbing:
- *   - the AudioContext is created lazily on the first user gesture
- *     (browser autoplay policy), via `unlock()`;
- *   - mp3 music per level arrives in Fas 5 — `playMusic` already validates
- *     its inputs so later waves can plug loaders in without API changes.
+ * Facade over two subsystems:
+ *   - Procedural SFX synthesis (see {@link ./SfxSynth}) routed through a
+ *     dedicated SFX bus (sfxGain → masterGain → destination).
+ *   - Per-level looping mp3 music (see {@link ./MusicPlayer}); the mp3 files
+ *     arrive in Fas 5, until then track lookups warn once and stay silent.
+ *
+ * Autoplay policy: the AudioContext is created lazily inside {@link unlock},
+ * which must run from a user gesture — {@link initOnInteraction} wires that
+ * up from main on the first keydown/pointerdown/touchend.
+ *
+ * Volume model: master · SFX gains are WebAudio GainNodes; music loudness is
+ * the product master·music pushed onto the media element (it bypasses the
+ * graph by design). All three are persisted through the SaveStore settings
+ * hook ({@link applySettings} / {@link captureVolumesInto}).
+ *
+ * Everything degrades gracefully: without WebAudio support, before unlock,
+ * or after dispose the engine simply stays silent instead of throwing.
  */
 
-export type SfxName =
-  | 'shoot'
-  | 'jump'
-  | 'double-jump'
-  | 'pickup'
-  | 'hit'
-  | 'death'
-  | 'weapon-swap'
-  | 'checkpoint'
-  | 'ui-click';
+import { MusicPlayer, type TrackUrlResolver } from './MusicPlayer';
+import { ALL_SFX_NAMES, createNoiseBuffer, SFX_SYNTHS } from './SfxSynth';
+import type { SfxName, SfxOptions } from './SfxSynth';
+import type {
+  AudioBufferLike,
+  AudioContextFactory,
+  AudioContextLike,
+  GainNodeLike,
+  InteractionTargetLike,
+  MediaElementFactory,
+} from './WebAudioTypes';
+import { type GameSettings, type SaveData } from '../save/SaveStore';
 
-interface SfxSpec {
-  type: OscillatorType;
-  fromFreq: number;
-  toFreq: number;
-  durationMs: number;
-  gain: number;
+export { ALL_SFX_NAMES };
+export type { SfxName, SfxOptions };
+
+export interface AudioEngineOptions {
+  /** Context factory; defaults to `new window.AudioContext()`. Inject a fake for tests. */
+  createContext?: AudioContextFactory;
+  /** Media-element factory for music; defaults to `new Audio(src)`. */
+  createMediaElement?: MediaElementFactory;
+  /** Track-id → URL resolver; defaults to Vite's bundled assets/music map. */
+  resolveTrackUrl?: TrackUrlResolver;
+  /** Warning sink; defaults to console.warn. */
+  onError?: (message: string) => void;
 }
 
-const SFX_LIBRARY: Readonly<Record<SfxName, SfxSpec>> = {
-  shoot: { type: 'square', fromFreq: 880, toFreq: 220, durationMs: 80, gain: 0.05 },
-  jump: { type: 'sine', fromFreq: 240, toFreq: 660, durationMs: 120, gain: 0.08 },
-  'double-jump': { type: 'sine', fromFreq: 420, toFreq: 990, durationMs: 130, gain: 0.08 },
-  pickup: { type: 'triangle', fromFreq: 660, toFreq: 1320, durationMs: 90, gain: 0.07 },
-  hit: { type: 'sawtooth', fromFreq: 300, toFreq: 60, durationMs: 160, gain: 0.1 },
-  death: { type: 'sawtooth', fromFreq: 440, toFreq: 40, durationMs: 400, gain: 0.12 },
-  'weapon-swap': { type: 'square', fromFreq: 520, toFreq: 780, durationMs: 70, gain: 0.05 },
-  checkpoint: { type: 'triangle', fromFreq: 523, toFreq: 1046, durationMs: 200, gain: 0.08 },
-  'ui-click': { type: 'square', fromFreq: 700, toFreq: 700, durationMs: 40, gain: 0.04 },
-};
-
 export class AudioEngine {
-  private context: AudioContext | null = null;
-  private masterGain: GainNode | null = null;
-  private volume = 0.8;
+  private readonly createContext: AudioContextFactory;
+  private readonly errorSink: (message: string) => void;
 
-  /** Must be called from a user-gesture handler (keydown/pointerdown). */
-  public async unlock(): Promise<void> {
-    if (this.context) {
-      if (this.context.state === 'suspended') await this.context.resume();
-      return;
-    }
-    const Ctor = window.AudioContext;
-    if (!Ctor) return; // No WebAudio (ancient browser): stay silent, never crash.
-    this.context = new Ctor();
-    this.masterGain = this.context.createGain();
-    this.masterGain.gain.value = this.volume;
-    this.masterGain.connect(this.context.destination);
-    await this.context.resume();
+  private readonly music: MusicPlayer;
+
+  private context: AudioContextLike | null = null;
+  private masterGain: GainNodeLike | null = null;
+  private sfxGain: GainNodeLike | null = null;
+  private noiseCache: AudioBufferLike | null = null;
+
+  private masterVolumeValue = 0.8;
+  private sfxVolumeValue = 0.9;
+  private musicVolumeValue = 0.7;
+
+  public constructor(options: AudioEngineOptions = {}) {
+    this.createContext = options.createContext ?? defaultContextFactory;
+    this.errorSink =
+      options.onError ??
+      ((message: string) => {
+        console.warn(message);
+      });
+
+    this.music = new MusicPlayer({
+      createElement: options.createMediaElement,
+      resolveTrackUrl: options.resolveTrackUrl,
+      onError: (message) => this.reportError(message),
+    });
+    this.syncMusicVolume();
   }
 
-  public setVolume(volume: number): void {
-    const clamped = Math.min(1, Math.max(0, volume));
-    this.volume = clamped;
-    if (this.masterGain) this.masterGain.gain.value = clamped;
-  }
-
+  /** True when a context exists and is running (i.e. SFX will be audible). */
   public get isUnlocked(): boolean {
     return this.context !== null && this.context.state === 'running';
   }
 
   /**
-   * Play a short synthesized effect. Safe to call before unlock()
-   * (it simply does nothing until the context exists).
+   * Creates + resumes the audio context. MUST be triggered from a user-gesture
+   * handler (autoplay policy). Idempotent; safe no-op when WebAudio is absent.
    */
-  public playSfx(name: SfxName): void {
-    const ctx = this.context;
-    const master = this.masterGain;
-    if (!ctx || !master || ctx.state !== 'running') return;
+  public async unlock(): Promise<void> {
+    if (this.context) {
+      if (this.context.state === 'suspended') await this.resumeQuietly(this.context);
+      return;
+    }
 
-    const spec = SFX_LIBRARY[name];
-    if (!spec) return;
+    const ctx = this.createContext();
+    if (!ctx) {
+      this.reportError('[audio] WebAudio unavailable in this environment — staying silent');
+      return;
+    }
 
-    const now = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const env = ctx.createGain();
+    this.context = ctx;
+    this.noiseCache = createNoiseBuffer(ctx);
 
-    osc.type = spec.type;
-    osc.frequency.setValueAtTime(spec.fromFreq, now);
-    osc.frequency.exponentialRampToValueAtTime(Math.max(1, spec.toFreq), now + spec.durationMs / 1000);
+    const master = ctx.createGain();
+    master.gain.value = this.masterVolumeValue;
+    master.connect(ctx.destination);
 
-    env.gain.setValueAtTime(spec.gain, now);
-    env.gain.exponentialRampToValueAtTime(0.0001, now + spec.durationMs / 1000);
+    const sfx = ctx.createGain();
+    sfx.gain.value = this.sfxVolumeValue;
+    sfx.connect(master);
 
-    osc.connect(env);
-    env.connect(master);
-    osc.start(now);
-    osc.stop(now + spec.durationMs / 1000 + 0.02);
+    this.masterGain = master;
+    this.sfxGain = sfx;
+
+    await this.resumeQuietly(ctx);
   }
 
   /**
-   * Placeholder music hook with real validation semantics: Fas 5 will pass
-   * per-level track ids backed by files in assets/music/. Unknown tracks are
-   * ignored rather than thrown so gameplay never crashes on audio.
+   * Registers one-shot unlock listeners for the first user interaction
+   * (keydown/pointerdown/touchend). `onUnlocked` fires once when the context
+   * actually starts running (e.g. for an "audio ready" confirmation blip).
+   * Returns a detach function for cleanup.
    */
-  public playMusic(trackId: string): boolean {
-    return typeof trackId === 'string' && trackId.length > 0;
+  public initOnInteraction(
+    target: InteractionTargetLike = defaultInteractionTarget(),
+    onUnlocked?: () => void,
+  ): () => void {
+    const events = ['keydown', 'pointerdown', 'touchend'] as const;
+    const detach = (): void => {
+      for (const event of events) target.removeEventListener(event, handler);
+    };
+    const handler = (): void => {
+      detach();
+      void this.unlock().then(() => {
+        if (this.isUnlocked) onUnlocked?.();
+      });
+    };
+    for (const event of events) target.addEventListener(event, handler);
+    return detach;
   }
 
+  // ---------------------------------------------------------------------------
+  // SFX
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Plays a procedural sound effect. Safe to call any time: before unlock,
+   * while muted, or with an unknown name it simply does nothing.
+   */
+  public playSfx(name: SfxName, options: SfxOptions = {}): void {
+    const ctx = this.context;
+    const out = this.sfxGain;
+    if (!ctx || !out || ctx.state !== 'running' || this.masterVolumeValue <= 0 || this.sfxVolumeValue <= 0) {
+      return;
+    }
+    const synth = SFX_SYNTHS[name];
+    if (!synth) return;
+
+    const noiseCache = this.noiseCache;
+    try {
+      synth({ ctx, noise: () => this.requireNoise(noiseCache) }, out, ctx.currentTime, options);
+    } catch (error) {
+      this.reportError(`[audio] SFX "${name}" failed: ${String(error)}`);
+    }
+  }
+
+  /** Convenience for iterating all effects (tests, settings UI demos). */
+  public get sfxNames(): readonly SfxName[] {
+    return ALL_SFX_NAMES;
+  }
+
+  private requireNoise(cached: AudioBufferLike | null): AudioBufferLike {
+    if (!cached) throw new Error('noise buffer missing — was the engine unlocked?');
+    return cached;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Volume control & persistence hooks
+  // ---------------------------------------------------------------------------
+
+  public get masterVolume(): number {
+    return this.masterVolumeValue;
+  }
+
+  public get sfxVolume(): number {
+    return this.sfxVolumeValue;
+  }
+
+  public get musicVolume(): number {
+    return this.musicVolumeValue;
+  }
+
+  public setMasterVolume(volume: number): void {
+    this.masterVolumeValue = clamp01(volume);
+    if (this.masterGain) this.masterGain.gain.value = this.masterVolumeValue;
+    this.syncMusicVolume();
+  }
+
+  public setSfxVolume(volume: number): void {
+    this.sfxVolumeValue = clamp01(volume);
+    if (this.sfxGain) this.sfxGain.gain.value = this.sfxVolumeValue;
+  }
+
+  public setMusicVolume(volume: number): void {
+    this.musicVolumeValue = clamp01(volume);
+    this.syncMusicVolume();
+  }
+
+  /** Loads volumes from persisted settings (SaveStore.saveData.settings). */
+  public applySettings(settings: GameSettings): void {
+    this.setMasterVolume(settings.volume);
+    this.setSfxVolume(settings.sfxVolume);
+    this.setMusicVolume(settings.musicVolume);
+  }
+
+  /** Writes current volumes into a SaveData blob so callers can persist it. */
+  public captureVolumesInto(data: SaveData): SaveData {
+    data.settings.volume = this.masterVolumeValue;
+    data.settings.sfxVolume = this.sfxVolumeValue;
+    data.settings.musicVolume = this.musicVolumeValue;
+    return data;
+  }
+
+  private syncMusicVolume(): void {
+    this.music.setVolume(this.masterVolumeValue * this.musicVolumeValue);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Music
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Starts looping the level track. Returns false (with a one-time warning)
+   * when the mp3 is missing from assets/music/ — expected until Fas 5.
+   */
+  public async playMusic(trackId: string): Promise<boolean> {
+    return this.music.play(trackId);
+  }
+
+  /** Pauses music keeping position (e.g. game paused). */
+  public pauseMusic(): void {
+    this.music.pause();
+  }
+
+  /** Resumes paused music; returns true when a resume was initiated. */
+  public resumeMusic(): boolean {
+    return this.music.resume();
+  }
+
+  /** Stops and unloads the current track. */
+  public stopMusic(): void {
+    this.music.stop();
+  }
+
+  public get currentMusicTrack(): string | null {
+    return this.music.currentTrackId;
+  }
+
+  public get musicIsPlaying(): boolean {
+    return this.music.isPlaying;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
+
+  /** Stops music and closes the context. The engine stays reusable after. */
   public dispose(): void {
-    void this.context?.close();
+    this.music.stop();
+    const ctx = this.context;
     this.context = null;
     this.masterGain = null;
+    this.sfxGain = null;
+    this.noiseCache = null;
+    if (ctx && ctx.state !== 'closed') void ctx.close().catch(() => undefined);
   }
+
+  private async resumeQuietly(ctx: AudioContextLike): Promise<void> {
+    try {
+      await ctx.resume();
+    } catch (error) {
+      this.reportError(`[audio] could not resume audio context: ${String(error)}`);
+    }
+  }
+
+  private reportError(message: string): void {
+    this.errorSink(message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Defaults (browser-only, guarded so importing this module never throws in Node)
+// ---------------------------------------------------------------------------
+
+function defaultContextFactory(): AudioContextLike | null {
+  if (typeof window === 'undefined') return null;
+  const Ctor = window.AudioContext;
+  if (!Ctor) return null;
+  return new Ctor();
+}
+
+function defaultInteractionTarget(): InteractionTargetLike {
+  if (typeof window !== 'undefined') return window;
+  return { addEventListener: () => undefined, removeEventListener: () => undefined };
+}
+
+function clamp01(value: number): number {
+  if (Number.isNaN(value)) return 0;
+  return Math.min(1, Math.max(0, value));
 }

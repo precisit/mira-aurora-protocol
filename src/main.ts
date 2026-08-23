@@ -13,6 +13,7 @@ import {
   type SpriteDraw,
 } from './renderer/WebGPURenderer';
 import { DomHud } from './ui/Hud';
+import { SaveStore } from './save/SaveStore';
 import './style.css';
 
 /**
@@ -32,9 +33,13 @@ const TINT_SOLID_A: Rgba = [0.16, 0.9, 1.0, 1];
 const TINT_SOLID_B: Rgba = [0.1, 0.62, 0.95, 1];
 const TINT_PLATFORM: Rgba = [1.0, 0.35, 0.85, 1];
 const TINT_HAZARD: Rgba = [1.0, 0.45, 0.15, 1];
-const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.8];
-const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.9];
+const GLOW_HAZARD: Rgba = [1.0, 0.45, 0.15, 1.4];
+const TINT_MARKER_CHECKPOINT: Rgba = [1.0, 0.9, 0.3, 0.9];
+const GLOW_MARKER_CHECKPOINT: Rgba = [1.0, 0.92, 0.35, 2.2];
+const TINT_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 0.95];
+const GLOW_MARKER_GOAL: Rgba = [0.55, 1.0, 0.45, 2.6];
 const TINT_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 0.8];
+const GLOW_MARKER_PICKUP: Rgba = [1.0, 0.4, 0.9, 2.4];
 
 interface DemoState {
   cameraX: number;
@@ -64,17 +69,13 @@ async function boot(): Promise<void> {
   const level = new Level(getLevel(1));
   const input = new InputManager();
   input.attach(window);
+  const save = new SaveStore();
   const audio = new AudioEngine();
+  audio.applySettings(save.load().settings); // persisted volumes (SaveStore hook)
+  const detachAudioUnlock = audio.initOnInteraction(window, () => audio.playSfx('ui-click'));
   const hud = new DomHud(document.getElementById('hud-root') ?? document.body);
   const state = new GameStateMachine();
   state.transition(GameStateName.Menu); // assets are ready → show menu
-
-  // Audio must unlock on the first user gesture (autoplay policy).
-  const unlockAudio = (): void => {
-    void audio.unlock().then(() => audio.playSfx('ui-click'));
-  };
-  window.addEventListener('keydown', unlockAudio, { once: true });
-  window.addEventListener('pointerdown', unlockAudio, { once: true });
 
   const demo: DemoState = { cameraX: 0, cameraDir: 1 };
 
@@ -113,28 +114,42 @@ async function boot(): Promise<void> {
             sprites.push({ x, y, width: TILE_SIZE, height: 10, tint: TINT_PLATFORM });
             break;
           case TileType.Hazard:
-            sprites.push({ x, y: y + 6, width: TILE_SIZE, height: TILE_SIZE - 12, tint: TINT_HAZARD });
+            sprites.push({
+              x,
+              y: y + 6,
+              width: TILE_SIZE,
+              height: TILE_SIZE - 12,
+              tint: TINT_HAZARD,
+              glow: GLOW_HAZARD,
+            });
             break;
         }
       }
     }
 
-    // Spawn-layer entities as glowing markers so the data is visible in-demo.
+    // Spawn-layer entities as additive glowing markers so the data is visible
+    // in-demo (exercises the neon-glow sprite path from the A1 wave).
     for (const spawn of level.data.spawns) {
       if (spawn.kind === 'playerSpawn') continue;
-      const tint =
-        spawn.kind === 'checkpoint'
-          ? TINT_MARKER_CHECKPOINT
-          : spawn.kind === 'exit'
-            ? TINT_MARKER_GOAL
-            : TINT_MARKER_PICKUP;
+      const isCheckpoint = spawn.kind === 'checkpoint';
+      const isExit = spawn.kind === 'exit';
       const height = TILE_SIZE * 2;
       sprites.push({
         x: Level.tileToWorldX(spawn.tx) + 10 - demo.cameraX,
         y: Level.tileToWorldY(spawn.ty + 1) - height,
         width: 12,
         height,
-        tint,
+        tint: isCheckpoint
+          ? TINT_MARKER_CHECKPOINT
+          : isExit
+            ? TINT_MARKER_GOAL
+            : TINT_MARKER_PICKUP,
+        glow: isCheckpoint
+          ? GLOW_MARKER_CHECKPOINT
+          : isExit
+            ? GLOW_MARKER_GOAL
+            : GLOW_MARKER_PICKUP,
+        blend: 'additive',
       });
     }
 
@@ -151,15 +166,19 @@ async function boot(): Promise<void> {
       ) {
         state.transition(GameStateName.Playing);
         audio.playSfx('checkpoint');
+        // Per-level track; warns once and stays silent until Fas 5 adds mp3s.
+        void audio.playMusic(level.data.id);
       }
       if (
         state.current === GameStateName.Paused &&
         (input.wasPressed(InputAction.Pause) || input.wasPressed(InputAction.Confirm))
       ) {
         state.transition(GameStateName.Playing);
+        audio.resumeMusic();
       }
       if (state.current === GameStateName.Playing && input.wasPressed(InputAction.Pause)) {
         state.transition(GameStateName.Paused);
+        audio.pauseMusic();
       }
 
       // Auto-pan the camera while playing (ping-pong across the level).
@@ -197,6 +216,7 @@ async function boot(): Promise<void> {
   window.addEventListener('beforeunload', () => {
     loop.stop();
     input.detach();
+    detachAudioUnlock();
     audio.dispose();
     hud.destroy();
   });
